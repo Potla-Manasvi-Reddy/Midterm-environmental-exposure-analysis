@@ -1,0 +1,447 @@
+---
+title: "Preliminary Exploration: Diesel PM and Demographics"
+subtitle: "EJScreen 2024 (v2.32), U.S. census tracts"
+author: "Kayla"
+date: today
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+## Research question
+
+Residents of different demographic groups live with different levels of modelled diesel PM. How much of that gap remains once we account for population density and income? (2024 EJScreen release only.)
+
+## Setup
+
+```{r}
+#| label: packages
+# First time only, run this line in the Console (not here) to install the packages:
+# install.packages(c("data.table", "dplyr", "ggplot2", "hexbin", "scales", "readxl"))
+
+library(data.table)   # fast reading of large CSV files (fread) and quick summaries
+library(dplyr)        # data manipulation verbs: mutate, filter, group_by, summarise
+library(ggplot2)      # making plots
+library(hexbin)       # needed by ggplot2 for hexagon-binned scatterplots (geom_hex)
+library(scales)       # nicer axis labels, e.g. commas in large numbers
+library(readxl)       # reading Excel files (.xlsx), used for the data dictionary
+
+theme_set(theme_minimal(base_size = 12))   # use a clean plot style, 12-pt text, for every plot
+```
+
+## Data
+
+**Source.** EJScreen 2024, produced by the U.S. EPA Office of Environmental Justice and External Civil Rights, and archived by the Environmental Data & Governance Initiative after EPA removed the tool (Fitzgerald & Gehrke, 2025, <https://doi.org/10.5281/zenodo.14767363>). We use the August 2024 update (folder `2.32_August_UseMe`), tract-level file with national percentiles. Variable definitions come from the EPA data dictionary that ships with the data (`EJScreen_2024_Tract_Percentiles_Columns.xlsx`), and units and methods from the EJScreen Technical Documentation for Version 2.3 (U.S. EPA, 2024).
+
+**What each row is.** One census tract (2022 boundaries). Tracts are the right level for this outcome: EPA receives diesel PM estimates by tract and copies the same value to every block group inside it, so block-group rows would repeat values and overstate precision.
+
+```{r}
+#| label: path
+# Folder on this laptop that holds the EJScreen 2024 (v2.32) files.
+# Teammates: change this one line to wherever the folder is on your computer.
+data_dir <- "/Users/kaylasmith1/INFO_536/2024/2.32_August_UseMe"
+
+# Build the full path to the tract data file by joining the folder and the file name.
+csv_path  <- file.path(data_dir, "EJScreen_2024_Tract_with_AS_CNMI_GU_VI.csv")
+
+# Build the full path to EPA's data dictionary (the column descriptions).
+dict_path <- file.path(data_dir, "EJScreen_2024_Tract_Percentiles_Columns.xlsx")
+
+# Check both files exist. Should print TRUE TRUE; a FALSE means the path or file name is wrong.
+file.exists(c(csv_path, dict_path))
+```
+
+### Data dictionary
+
+```{r}
+#| label: dictionary
+# Read the first sheet of the Excel data dictionary into a table.
+dict <- read_excel(dict_path)
+
+# Keep only the first three columns (the file has extra blank columns to the right).
+dict <- dict[, 1:3]
+
+# Rename the three columns to short names that are easier to type.
+names(dict) <- c("number", "column", "description")
+
+# Drop any completely blank rows at the bottom of the sheet.
+dict <- dict[!is.na(dict$column), ]
+
+# Remove stray spaces around column names (a few, like "D5_OZONE ", have a trailing space in EPA's file).
+dict$column <- trimws(dict$column)
+
+# Show how many columns the dictionary describes (should be 231).
+nrow(dict)
+```
+
+```{r}
+#| label: variables-used
+# The columns our analysis uses, in the order we want them listed.
+wanted <- c("ID", "ST_ABBREV", "REGION", "ACSTOTPOP", "PEOPCOLORPCT",
+            "LOWINCPCT", "DSLPM", "P_DSLPM", "OZONE", "AREALAND", "PTRAF")
+
+# Units are not in the dictionary, so we add them by hand from the Technical Documentation.
+units <- c(ID = "11-digit code", ST_ABBREV = "", REGION = "1 to 10",
+           ACSTOTPOP = "people", PEOPCOLORPCT = "proportion (0 to 1)",
+           LOWINCPCT = "proportion (0 to 1)", DSLPM = "µg/m³",
+           P_DSLPM = "national percentile (0 to 100)", OZONE = "ppb",
+           AREALAND = "square meters", PTRAF = "daily traffic ÷ distance (km)")
+
+dict %>%
+  filter(column %in% wanted) %>%                        # keep only the rows for our columns
+  mutate(units = units[column]) %>%                     # attach the unit for each column
+  arrange(match(column, wanted)) %>%                    # put rows in the same order as `wanted`
+  select(column, description, units) %>%                # drop the dictionary's number column
+  knitr::kable(col.names = c("Column", "EPA description", "Units"))   # print as a neat table
+```
+
+**Finding:** All eleven columns we use are defined in EPA's data dictionary. The dictionary does not give units, so those come from the Technical Documentation. The dictionary was written for the geodatabase version of the data, so a few names differ slightly from our CSV (for example `OBJECTID` vs. `OID_`, and `EXCEED2_COUNT_80` vs. `EXCEED_COUNT_80`); none of those columns are used here.
+
+### Load the data
+
+```{r}
+#| label: columns
+# Read only the header row of the CSV (nrows = 0) to get the list of column names without loading any data.
+all_cols <- names(fread(csv_path, nrows = 0))
+
+# Print the column names.
+all_cols
+```
+
+```{r}
+#| label: dictionary-match
+# Columns that appear in our CSV but not in the dictionary (naming differences between file versions).
+setdiff(all_cols, dict$column)
+
+# Columns that appear in the dictionary but not in our CSV.
+setdiff(dict$column, all_cols)
+```
+
+```{r}
+#| label: load
+#| cache: true
+# Find any column in `wanted` that is not in the file.
+missing_cols <- setdiff(wanted, all_cols)
+
+# If any are missing, stop with a message naming them, so we know what to fix.
+if (length(missing_cols)) {
+  stop("Not in file, rename in `wanted`: ", paste(missing_cols, collapse = ", "))
+}
+
+ej_raw <- fread(csv_path,                                  # read the tract CSV
+                select = wanted,                           # load only the columns we need
+                colClasses = list(character = "ID"),       # read ID as text so leading zeros are kept
+                na.strings = c("", "NA", "None"))          # treat blanks, "NA", and "None" as missing
+
+# Count the rows (tracts) loaded.
+nrow(ej_raw)
+```
+
+**Finding:** The file contains **86,082 rows**. This matches what we expect: about 85,400 census tracts across the 50 states, D.C., and Puerto Rico, plus the 686 territory records described in the Technical Documentation.
+
+### Does the outcome match the documentation?
+
+The Technical Documentation reports diesel PM ranging from 0.0000556 to 2.979 µg/m³, with a median of 0.156 and a 95th percentile of 0.447 (block-group level). Tract values should be close.
+
+```{r}
+#| label: dsl-check
+# Minimum, median, 95th percentile, and maximum of diesel PM, ignoring missing values.
+quantile(ej_raw$DSLPM, c(0, 0.5, 0.95, 1), na.rm = TRUE)
+```
+
+**Finding:** Our values line up with EPA's published figures, confirming we loaded the right file and units (µg/m³).
+
+|                 | Our tract file | Documentation (block groups) |
+|-----------------|----------------|------------------------------|
+| Minimum         | 0.00056        | 0.000056                     |
+| Median          | 0.156          | 0.156                        |
+| 95th percentile | 0.475          | 0.447                        |
+| Maximum         | 1.68           | 2.98                         |
+
+The medians are identical. The extremes are narrower in our file, most likely because tract values combine several block groups, which pulls in the highest and lowest values. The distribution is strongly right-skewed: the maximum is more than ten times the median, which suggests modelling diesel PM on a log scale.
+
+## Missing data: who drops out, and where
+
+According to the Technical Documentation, diesel PM is **not available for Alaska, American Samoa, the Northern Mariana Islands, Guam, or the U.S. Virgin Islands**. Hawaii and Puerto Rico are included. These places will drop out of every model below.
+
+```{r}
+#| label: missing-by-variable
+# For each column, count how many values are missing (NA).
+sapply(ej_raw, function(x) sum(is.na(x)))
+```
+
+**Finding:** Counts of missing values by column:
+
+- **686** tracts are missing population, race, income, and land area. These are exactly the 686 territory records, which have no ACS demographic data in this file.
+- **1,478** tracts are missing diesel PM (and its percentile). These are the tracts our models will lose; the next table shows where they are.
+- **2,306** tracts are missing ozone. More are missing because ozone is also unavailable for Hawaii and Puerto Rico. This only affects the ozone comparison.
+
+```{r}
+#| label: missing-by-state
+miss_by_state <- ej_raw[, .(tracts      = .N,                                  # number of tracts in the state
+                            missing_dsl = sum(is.na(DSLPM)),                   # tracts with no diesel PM value
+                            zero_pop    = sum(ACSTOTPOP == 0, na.rm = TRUE),   # tracts where nobody lives
+                            people      = sum(ACSTOTPOP, na.rm = TRUE)),       # total residents in the state
+                        by = ST_ABBREV][                                       # do this separately for each state
+                        order(-missing_dsl)]                                   # sort: most missing first
+
+# Show the 15 states or territories with the most missing diesel values.
+head(miss_by_state, 15)
+```
+
+**Finding:** Missing diesel PM is concentrated in a few places:
+
+- **The four territories** (U.S. Virgin Islands, Northern Mariana Islands, American Samoa, Guam) are missing every value. Their population shows as 0 only because the population column is blank for them.
+- **Alaska is missing all 177 tracts, covering about 735,000 residents.** An entire state falls outside the analysis.
+- **Michigan, Florida, New York, Puerto Rico, California, and others** are missing only a few tracts each. These states also have many tracts with zero population, suggesting the gaps are mostly unpopulated areas such as water, parks, and airports. We check this below.
+
+### Are the remaining gaps mostly empty tracts?
+
+```{r}
+#| label: missing-check
+ej_raw[is.na(DSLPM) &                                            # tracts missing diesel PM...
+       !ST_ABBREV %in% c("AK", "VI", "MP", "AS", "GU"),          # ...that are not in Alaska or the territories
+       .(missing_tracts      = .N,                               # how many such tracts
+         under_100_residents = sum(ACSTOTPOP < 100, na.rm = TRUE))]   # how many have fewer than 100 people
+```
+
+**Finding:** Yes. Of the 615 scattered missing tracts outside Alaska and the territories, **611 have fewer than 100 residents**. Only 4 populated tracts are missing diesel PM for no obvious reason.
+
+| Group | Tracts | Why missing |
+|---------------------|------------------|---------------------------------|
+| Territories (VI, MP, AS, GU) | 686 | EPA does not model diesel PM there |
+| Alaska | 177 | EPA does not model diesel PM there |
+| Nearly empty tracts elsewhere | 611 | Fewer than 100 residents (water, parks, airports) |
+| Other | 4 | Unexplained |
+| **Total** | **1,478** |  |
+
+**Takeaway:** The meaningful gap is Alaska's roughly 735,000 residents. Our results describe the other 49 states, D.C., and Puerto Rico, not the whole country. The nearly empty tracts would be removed by our 100-resident minimum anyway, so the missing data and our exclusion rule point the same way.
+
+## Cleaning
+
+```{r}
+#| label: clean
+# Helper: if a column is stored as proportions (all values 1 or less), multiply by 100 to get percentages.
+to_pct <- function(x) if (max(x, na.rm = TRUE) <= 1) 100 * x else x
+
+# Minimum population for a tract to be included -- justify this in the report.
+MIN_POP <- 100
+
+ej <- ej_raw %>%
+  mutate(pct_poc     = to_pct(PEOPCOLORPCT),     # % people of color, on a 0-100 scale
+         pct_lowinc  = to_pct(LOWINCPCT),        # % low income, on a 0-100 scale
+         area_km2    = AREALAND / 1e6,           # land area: square meters -> square kilometers
+         density     = ACSTOTPOP / area_km2,     # population density: people per km^2
+         log_density = log10(density),           # density on a log10 scale (it is very skewed)
+         log_dsl     = log10(DSLPM),             # diesel PM on a log10 scale (the model outcome)
+         poc10       = pct_poc / 10,             # % people of color in units of 10 points
+         lowinc10    = pct_lowinc / 10) %>%      # % low income in units of 10 points
+  filter(!is.na(DSLPM), DSLPM > 0,               # drop tracts with no diesel PM (Alaska, territories, empty tracts)
+         !is.na(pct_poc), !is.na(pct_lowinc),    # drop tracts missing demographics
+         ACSTOTPOP >= MIN_POP,                   # drop tracts with fewer than 100 residents
+         area_km2 > 0)                           # drop tracts with no land area (avoids dividing by zero)
+
+# Show how many tracts we started with, kept, and dropped.
+tibble(loaded = nrow(ej_raw), kept = nrow(ej), dropped = nrow(ej_raw) - nrow(ej))
+```
+
+```{r}
+#| label: dropped-vs-kept
+ej_raw %>%
+  mutate(kept = ID %in% ej$ID) %>%                          # TRUE if the tract survived cleaning
+  group_by(kept) %>%                                        # compare kept vs. dropped tracts
+  summarise(n = n(),                                        # number of tracts in each group
+            median_pop = median(ACSTOTPOP, na.rm = TRUE),   # typical population
+            median_dsl = median(DSLPM, na.rm = TRUE))       # typical diesel PM
+```
+
+**Finding:** We kept 84,222 (97.8%) of 86,082 tracts and dropped 1,860. Dropped tracts have a median population of 0 compared with 3,772 for kept tracts, which confirms most are empty or nearly empty places plus Alaska and the territories.
+
+```{r}
+#| label: summary
+# Min, quartiles, mean, and max for the main variables after cleaning.
+summary(ej[, c("DSLPM", "pct_poc", "pct_lowinc", "density")])
+```
+
+## Distribution of the outcome
+
+```{r}
+#| label: fig-dsl-raw
+#| fig-cap: "Modelled diesel PM across tracts with 100+ residents, raw scale. Source: EJScreen 2024 (AirToxScreen 2020 estimates)."
+ggplot(ej, aes(DSLPM)) +                                     # plot diesel PM from the cleaned data
+  geom_histogram(bins = 80, fill = "grey40") +               # histogram with 80 bars
+  labs(title = "Diesel PM is strongly right-skewed",         # title states the point of the figure
+       x = "Modelled diesel PM (µg/m³)", y = "Number of tracts")
+```
+
+```{r}
+#| label: fig-dsl-log
+#| fig-cap: "Same data on a log scale."
+ggplot(ej, aes(DSLPM)) +                                     # same data as above
+  geom_histogram(bins = 80, fill = "grey40") +               # same histogram
+  scale_x_log10() +                                          # but the x-axis is on a log scale
+  labs(title = "On a log scale, diesel PM is close to symmetric",
+       x = "Modelled diesel PM (µg/m³, log scale)", y = "Number of tracts")
+```
+
+**Finding:** On the raw scale, most tracts bunch near zero with a long tail to the right. On the log scale the distribution is roughly symmetric. This is why our models use log10(diesel PM) as the outcome: it keeps a few very high tracts from dominating the fit, and it lets us read coefficients as percent changes.
+
+## Diesel PM vs. share of residents of color
+
+```{r}
+#| label: fig-dsl-poc
+#| fig-cap: "Each hexagon counts tracts; the red line is a smoothed average with its confidence band."
+ggplot(ej, aes(pct_poc, DSLPM)) +                            # x = % people of color, y = diesel PM
+  geom_hex(bins = 60) +                                      # count tracts in hexagons (80k points would overlap)
+  geom_smooth(colour = "firebrick") +                        # add a smoothed average trend line
+  scale_y_log10() +                                          # diesel PM on a log scale
+  scale_fill_viridis_c(trans = "log10", name = "Tracts") +   # hexagon color = number of tracts (log scale)
+  labs(title = "Tracts with more residents of color have higher modelled diesel PM",
+       x = "Residents who are people of color (%)",
+       y = "Modelled diesel PM (µg/m³, log scale)")
+```
+
+**Finding:** Modelled diesel PM rises with the share of residents of color. The average goes from roughly 0.06 µg/m³ in tracts with almost no residents of color to roughly 0.2 µg/m³ in tracts that are 75–90% people of color, about a threefold difference. The rise is steepest between 0% and 25% and then levels off, so the relationship is not a straight line. At every level, diesel PM still varies about 100-fold between tracts, so % people of color explains only part of the picture.
+
+## The main confounder: density
+
+```{r}
+#| label: fig-dsl-density
+ggplot(ej, aes(density, DSLPM)) +                            # x = population density, y = diesel PM
+  geom_hex(bins = 60) +                                      # hexagon counts of tracts
+  geom_smooth(colour = "firebrick") +                        # smoothed trend line
+  scale_x_log10(labels = label_comma()) +                    # density on a log scale, with commas
+  scale_y_log10() +                                          # diesel PM on a log scale
+  scale_fill_viridis_c(trans = "log10", name = "Tracts") +   # color = number of tracts
+  labs(title = "Denser tracts have much higher modelled diesel PM",
+       x = "Population density (people per km², log scale)",
+       y = "Modelled diesel PM (µg/m³, log scale)")
+```
+
+```{r}
+#| label: fig-poc-density
+ggplot(ej, aes(log_density, pct_poc)) +                      # x = log density, y = % people of color
+  geom_hex(bins = 60) +                                      # hexagon counts of tracts
+  scale_fill_viridis_c(trans = "log10", name = "Tracts") +   # color = number of tracts
+  labs(title = "Rural tracts are mostly white; dense tracts span the full range",
+       x = "Population density (log10 people per km²)",
+       y = "Residents who are people of color (%)")
+```
+
+**Finding:** Population density and the share of residents of color are linked. Low-density tracts (roughly 10 to 300 people per km²) mostly have under 25% residents of color, while tracts that are majority people of color are almost all in suburban or urban densities (1,000+ people per km²). Because denser places also have higher diesel PM, part of the gap in the previous figure may reflect where people live rather than who lives there. This is why we adjust for density in the multiple regression. Importantly, dense tracts span the full range from 0% to 100% people of color, so the data contain many tracts with similar density but different demographics, which allows the regression to separate the two.
+
+### How strongly do the predictors move together?
+
+```{r}
+#| label: correlations
+# Correlation between each pair of predictors, rounded to 2 decimals (1 = move together perfectly, 0 = unrelated).
+round(cor(ej[, c("pct_poc", "pct_lowinc", "log_density")]), 2)
+```
+
+**Finding:** The correlation between % people of color and % low income is **0.45**, between % people of color and density **0.48**, and between % low income and density **0.05**. None is high enough (above about 0.7) to prevent us from estimating their separate effects. The predictors overlap moderately, so we expect the people-of-color coefficient to shrink when income and density are added. Notably, income and density are nearly unrelated: low-income tracts are as common in rural areas as in cities. Since % people of color is linked to both, the two controls account for different parts of its association with diesel PM.
+
+## Regional differences
+
+```{r}
+#| label: fig-region
+ggplot(ej, aes(factor(REGION), DSLPM)) +                     # x = EPA region (as a category), y = diesel PM
+  geom_boxplot(outlier.alpha = 0.1) +                        # box plot per region; faint outlier dots
+  scale_y_log10() +                                          # diesel PM on a log scale
+  labs(title = "Diesel PM levels differ by EPA region",
+       x = "EPA region", y = "Modelled diesel PM (µg/m³, log scale)")
+```
+
+## Preview: population-weighted exposure
+
+Rough version using EJScreen's own columns. The full group-by-group version needs an ACS pull later.
+
+```{r}
+#| label: pop-weighted
+ej %>%
+  mutate(pop_poc   = ACSTOTPOP * pct_poc / 100,                              # number of people of color in each tract
+         pop_other = ACSTOTPOP - pop_poc) %>%                                # number of non-Hispanic white residents
+  summarise(`People of color`              = weighted.mean(DSLPM, pop_poc),  # diesel PM the average person of color lives with
+            `Non-Hispanic white residents` = weighted.mean(DSLPM, pop_other),# same for non-Hispanic white residents
+            `All residents`                = weighted.mean(DSLPM, ACSTOTPOP)) %>%  # same for everyone
+  mutate(across(everything(), ~ round(.x, 3)))                               # round to 3 decimals
+```
+
+**Finding:** The average person of color in our data lives in a tract with **0.236 µg/m³** of modelled diesel PM, compared with **0.163 µg/m³** for the average non-Hispanic white resident and **0.193 µg/m³** for all residents. That is a gap of 0.073 µg/m³, or about **45% higher** exposure for people of color. This is the raw gap before accounting for density or income; the regressions below test how much of it remains after adjustment. Because diesel PM is a single value per tract, this assumes everyone in a tract lives with the same level, and it describes groups of people, not any individual's exposure.
+
+```{r}
+#| label: models
+# Simple regression: log diesel PM explained by % people of color only.
+m_simple <- lm(log_dsl ~ poc10, data = ej)
+
+# Multiple regression: add density, income, and EPA region (as a category).
+m_multi  <- lm(log_dsl ~ poc10 + log_density + lowinc10 + factor(REGION), data = ej)
+
+# Helper: turn a log10 coefficient into a % change in diesel PM, with its 95% confidence interval.
+pct_change <- function(m, term = "poc10") {
+  est <- c(coef(m)[term], confint(m)[term, ])   # estimate, lower bound, upper bound (log10 scale)
+  round((10^est - 1) * 100, 1)                  # convert to % change and round to 1 decimal
+}
+
+tibble(model    = c("Simple", "Adjusted (density, income, region)"),        # one row per model
+       estimate = c(pct_change(m_simple)[1], pct_change(m_multi)[1]),       # % change per +10 points
+       ci_low   = c(pct_change(m_simple)[2], pct_change(m_multi)[2]),       # lower 95% bound
+       ci_high  = c(pct_change(m_simple)[3], pct_change(m_multi)[3]))       # upper 95% bound
+```
+
+**Finding:** In the simple model, a tract with 10 percentage points more residents of color has **10.6%** higher modelled diesel PM (95% CI: 10.4% to 10.8%). After accounting for density, income, and region, that falls to **2.9%** (95% CI: 2.7% to 3.0%). Comparing the coefficients on the log scale, about **72%** of the original association is explained by those factors, and about **28%** remains. Across the full range, a tract with 100% residents of color has about 2.7 times the diesel PM of one with 0% in the simple model, and about 1.3 times after adjustment. The remaining gap is small but clearly above zero. The intervals are narrow because of the large number of tracts, but they likely understate the true uncertainty, since neighboring tracts are not independent.
+
+```{r}
+#| label: model-traffic
+ej <- ej %>%
+  mutate(log_traffic = log10(PTRAF + 1))   # traffic is very skewed; +1 avoids taking the log of zero
+
+# Same as the adjusted model, plus traffic proximity
+m_traffic <- lm(log_dsl ~ poc10 + log_density + lowinc10 + log_traffic + factor(REGION), data = ej)
+
+nobs(m_traffic)         # number of tracts used (should be close to 84,222)
+pct_change(m_traffic)   # % change per +10 points people of color: estimate, lower, upper
+```
+
+**Finding:** Adding traffic proximity (all 84,222 tracts used) reduces the association further: among tracts with similar density, income, region, and nearness to heavy traffic, 10 percentage points more residents of color goes with **1.6%** higher modelled diesel PM (95% CI: 1.5% to 1.8%), down from 2.9%. On the log scale, about **45%** of the remaining gap runs through proximity to traffic, and only about **16%** of the original simple-model association is left after all adjustments. The interval is still entirely above zero. Traffic proximity is best read as a *pathway* rather than a confounder: neighborhoods of color are closer to busy roads, which is one of the ways the disparity arises, consistent with the history of highways being routed through these neighborhoods.
+
+### Residual checks
+
+```{r}
+#| label: fig-resid-simple
+#| fig-cap: "Residual diagnostics, simple model."
+#| fig-width: 8
+#| fig-height: 7
+par(mfrow = c(2, 2))   # arrange the next plots in a 2 x 2 grid
+plot(m_simple)         # R's four standard diagnostic plots for a linear model
+```
+
+**Finding (simple model):**
+
+- **Linearity:** the red line in the Residuals vs Fitted panel is mostly flat, with a small dip at low fitted values. This matches the scatterplot, where diesel PM rises steeply between 0% and 25% residents of color and then levels off, so a straight line is a reasonable but imperfect summary.
+- **Constant variance:** the Scale-Location line is nearly flat, so the spread of residuals is roughly constant, with slightly more spread at the highest fitted values.
+- **Normality:** the Q-Q plot bends well below the line at the lower end, showing a long lower tail: some tracts have much lower diesel PM than the model predicts. With 84,222 tracts, this has little effect on the coefficient or its confidence interval.
+- **Influential points:** leverage values are tiny and no tract approaches the Cook's distance threshold, so no single tract drives the result.
+- **Independence:** doubtful. Neighboring tracts share highways, freight corridors, and the same air model inputs, so their errors are likely related, which makes our intervals look more precise than they are.
+
+```{r}
+#| label: fig-resid-multi
+#| fig-cap: "Residual diagnostics, adjusted model."
+#| fig-width: 8
+#| fig-height: 7
+par(mfrow = c(2, 2))   # 2 x 2 grid
+plot(m_multi)          # diagnostic plots for the multiple regression
+```
+
+**Finding (adjusted model):**
+
+- **Fit improved:** compared with the simple model, predicted values span a much wider range (about 0.01 to 0.5 µg/m³ instead of 0.10 to 0.25), and residuals are smaller. Adding density, income, and region lets the model distinguish tracts much better.
+- **Linearity:** the Residuals vs Fitted line is mostly flat, bending up slightly at the highest fitted values, so a linear model is reasonable.
+- **Constant variance:** the Scale-Location line is not perfectly flat; residuals spread out more for tracts with the highest predicted diesel PM. This mild unevenness means standard confidence intervals may be slightly too narrow, so we also report clustered standard errors.
+- **Normality:** the Q-Q plot shows heavier tails than a normal distribution at both ends. With 84,222 tracts, this has little effect on the coefficient estimates.
+- **Influential points:** leverage values remain tiny and no tract approaches the Cook's distance threshold.
+- **Independence:** doubtful, for the same reasons as the simple model. Neighboring tracts share highways and air model inputs, so their errors are related.
