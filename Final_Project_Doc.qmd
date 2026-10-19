@@ -1,0 +1,1055 @@
+---
+title: "Models Tested: Diesel PM, Demographics, Density, Income, and Region"
+subtitle: "Linear and logistic regression on EJScreen 2024 census tracts"
+author: "Kayla"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+# 1 Overview
+
+**Research question.** Residents of different demographic groups live with different levels of modelled diesel PM. How much of that gap remains once we account for population density, income, and geographic location?
+
+This file covers **only the models**. Data cleaning, missing data, and the Du Bois figure are in the main analysis file. Each section opens with a question, then the code, then an **Understanding the output** note.
+
+**Every model tested**
+
+| Model | Type | Formula (outcome ~ predictors) | What it asks | Section |
+|---|---|---|---|---|
+| `m1` | Simple linear | `log_dsl ~ poc10` | Do tracts with more residents of color have more diesel PM? | 2 |
+| `m2` | Multiple linear | `+ log_density` | ...among tracts with the same density? | 3.1 |
+| `m3` | Multiple linear | `+ lowinc10` | ...and the same income? | 3.1 |
+| `m4` | Multiple linear (**main**) | `+ region` | ...and in the same EPA region? | 3.1–3.2 |
+| `m4c` | Multiple linear | `m4` with centered predictors | What does a *typical* tract look like? | 4.2 |
+| `m4_rl` | Multiple linear | `m4` with Southeast as reference | Does the reference region matter? | 5.2 |
+| `m5` | Multiple linear + interaction | `poc10 * region + log_density + lowinc10` | Is the people-of-color slope different in each region? | 5.3 |
+| Within-region | Multiple linear ×10 | `m3` formula, fit in each region alone | What is each region's own slope? | 5.3 |
+| `m4z` | Standardized `m4` | all numeric variables in SD units | Which predictor matters most on a common scale? | 7.1 |
+| `m_logit` | Logistic | `top20 ~ poc10 + log_density + lowinc10 + region` | Is a tract in the national top 20%? | 8.1–8.4 |
+| Cutoff models | Logistic ×4 | `m_logit` at the 70th, 80th, 90th, 95th percentile | Does the answer depend on the cutoff? | 8.5 |
+| `m_train` | Logistic | `m_logit` on 70% of counties | How well does it predict unseen places? | 8.6 |
+
+**Variables used in every model**
+
+| Variable | Meaning | A one-unit increase means |
+|---|---|---|
+| `log_dsl` | log10 of modelled diesel PM (µg/m³), the outcome | ten times more diesel PM |
+| `poc10` | % residents who are people of color ÷ 10 | 10 more percentage points of residents of color |
+| `log_density` | log10 of people per km² | a tract ten times denser |
+| `lowinc10` | % low-income residents ÷ 10 | 10 more percentage points of low-income residents |
+| `region` | EPA region (category, 10 levels) | compared with Region 1, New England |
+| `top20` | 1 if the tract is at or above the 80th national percentile for diesel PM | (logistic outcome) |
+
+Because the outcome is on a log10 scale, every linear coefficient *b* is reported as a **percent change** in diesel PM: (10^*b* − 1) × 100.
+
+## 1.1 Setup: load the data and build the model variables
+
+```{r}
+#| label: setup
+# First time only, in the Console:
+# install.packages(c("data.table", "dplyr", "ggplot2", "scales", "sandwich", "lmtest", "pROC"))
+library(data.table)   # fast CSV reading
+library(dplyr)        # data manipulation
+library(ggplot2)      # plots
+library(scales)       # axis label formatting
+library(sandwich)     # clustered standard errors
+library(lmtest)       # confidence intervals and tests using those standard errors
+library(pROC)         # ROC curve and AUC for the logistic model
+theme_set(theme_minimal(base_size = 13))   # one plot style for every figure
+
+# Folder holding the EJScreen 2024 (v2.32) files. Teammates: change only this line.
+data_dir <- "/Users/kaylasmith1/INFO_536/2024/2.32_August_UseMe"
+csv_path <- file.path(data_dir, "EJScreen_2024_Tract_with_AS_CNMI_GU_VI.csv")
+
+wanted <- c("ID", "ST_ABBREV", "REGION", "ACSTOTPOP", "PEOPCOLORPCT",
+            "LOWINCPCT", "DSLPM", "P_DSLPM", "AREALAND")
+ej_raw <- fread(csv_path, select = wanted,
+                colClasses = list(character = "ID"),    # keep leading zeros in the tract code
+                na.strings = c("", "NA", "None"))
+
+to_pct <- function(x) if (max(x, na.rm = TRUE) <= 1) 100 * x else x   # proportions to percentages
+region_labels <- c("1 New England", "2 NY/NJ/PR", "3 Mid-Atlantic", "4 Southeast",
+                   "5 Great Lakes", "6 South Central", "7 Central Plains",
+                   "8 Mountains & Plains", "9 Pacific Southwest", "10 Pacific Northwest")
+
+ej <- ej_raw %>%
+  mutate(pct_poc     = to_pct(PEOPCOLORPCT),                  # % people of color, 0-100
+         pct_lowinc  = to_pct(LOWINCPCT),                     # % low income, 0-100
+         density     = ACSTOTPOP / (AREALAND / 1e6),          # people per km^2
+         log_density = log10(density),                        # each +1 = ten times denser
+         log_dsl     = log10(DSLPM),                          # outcome on a log10 scale
+         poc10       = pct_poc / 10,                          # units of 10 percentage points
+         lowinc10    = pct_lowinc / 10,                       # units of 10 percentage points
+         region      = factor(as.integer(gsub("\\D", "", REGION)),   # EPA region as a category
+                              levels = 1:10, labels = region_labels),
+         county      = substr(ID, 1, 5)) %>%                  # state + county code, for clustering
+  filter(!is.na(DSLPM), DSLPM > 0, !is.na(pct_poc), !is.na(pct_lowinc),
+         ACSTOTPOP >= 100, AREALAND > 0)                      # same rules as the main file
+
+nrow(ej)                                                      # tracts used in every model
+```
+```{r}
+#| label: fig-dropped
+#| fig-cap: "Why 1,860 of 86,082 census tracts were dropped before modelling. Each tract is counted once, under the first reason that applies."
+#| fig-width: 8
+#| fig-height: 3.5
+dropped <- ej_raw %>%
+  filter(!ID %in% ej$ID) %>%                                           # tracts that did not survive cleaning
+  mutate(reason = case_when(
+    ST_ABBREV %in% c("VI", "MP", "AS", "GU") ~ "U.S. territories (no diesel model)",
+    ST_ABBREV == "AK"                         ~ "Alaska (no diesel model)",
+    ACSTOTPOP < 100                           ~ "Fewer than 100 residents",
+    TRUE                                      ~ "Other (missing diesel, demographics, or land area)")) %>%
+  dplyr::count(reason)                                                 # one row per reason
+
+dropped                                                                # the table: should sum to 1,860
+
+ggplot(dropped, aes(x = n, y = reorder(reason, n))) +
+  geom_col(fill = "grey45", width = 0.6) +
+  geom_text(aes(label = format(n, big.mark = ",")), hjust = -0.2, size = 4) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Dropped tracts by category",
+       x = "Tracts dropped", y = NULL)
+```
+
+**Understanding the output:** every model below uses the same **84,222 tracts** (49 states, D.C., and Puerto Rico; tracts with at least 100 residents and a diesel estimate).
+
+```{r}
+#| label: helpers
+# Convert a coefficient on the log10 scale into "% change in diesel PM"
+to_pct_change <- function(b) (10^b - 1) * 100
+
+# Fit statistics for one model: R^2, adjusted R^2, residual standard error
+fit_stats <- function(m) {
+  s <- summary(m)
+  c(r_squared = s$r.squared, adj_r_squared = s$adj.r.squared, rse = s$sigma)
+}
+
+# Coefficient table: estimate, % change, county-clustered 95% CI, t statistic, and p-value
+coef_table <- function(m) {
+  vc <- vcovCL(m, cluster = ej$county)                       # clustered standard errors
+  ci <- coefci(m, vcov. = vc)                                # clustered CI on the log10 scale
+  ct <- coeftest(m, vcov. = vc)                              # clustered t statistics and p-values
+  data.frame(term           = names(coef(m)),
+             estimate       = round(coef(m), 4),
+             pct_change     = round(to_pct_change(coef(m)), 1),
+             clustered_low  = round(to_pct_change(ci[, 1]), 1),
+             clustered_high = round(to_pct_change(ci[, 2]), 1),
+             t_value        = round(ct[, 3], 2),             # estimate / clustered SE
+             p_value        = signif(ct[, 4], 3),            # chance of a |t| this large if the true effect were 0
+             row.names = NULL)
+}
+```
+
+# 2 Model 1: Simple Linear Regression
+
+> **Model tested:** `m1 <- lm(log_dsl ~ poc10)`. One predictor, % people of color.
+
+## 2.1 Question 1: How does diesel PM change with the share of residents of color?
+
+Fit log diesel PM on % people of color alone. Predict the sign of the slope before running it.
+
+```{r}
+#| label: simple
+m1 <- lm(log_dsl ~ poc10, data = ej)          # one predictor
+
+summary(m1)
+```
+
+```{r}
+#| label: simple-readable
+data.frame(
+  term       = c("(Intercept)", "poc10"),
+  estimate   = round(coef(m1), 4),
+  readable   = c(paste(round(10^coef(m1)[1], 3), "µg/m³ predicted at 0% residents of color"),
+                 paste0(round(to_pct_change(coef(m1)[2]), 1), "% more diesel PM per +10 points")),
+  row.names  = NULL
+)
+```
+
+**Understanding the output:**
+
+- **The slope (`poc10`)** is **0.0438** on the log10 scale. Each additional 10 percentage points of residents of color is associated with about **10.6%** more modelled diesel PM (95% CI: 10.4% to 10.8%). Across the full range, the model predicts about **0.097 µg/m³** at 0% residents of color and **0.265 µg/m³** at 100%, about **2.7 times** as much.
+- **The intercept** is **−1.015**, so a tract with 0% residents of color is predicted to have 10^−1.015 ≈ **0.097 µg/m³**. This is not an extrapolation: many tracts have almost no residents of color, and the value matches the left edge of the scatterplot.
+- **R²** is **0.158**: % people of color alone explains about **16%** of the variation in log diesel PM. The relationship is real but explains a modest share; most of the variation comes from other factors.
+- **Residual standard error** is **0.304** on the log10 scale, so a typical prediction is off by a factor of about 10^0.304 ≈ **2**. Residuals are lopsided: the largest misses are tracts with far *less* diesel PM than predicted (up to about 190 times less), consistent with the long lower tail in the Q-Q plot.
+- **p-values** are effectively zero, but with 84,222 tracts that only shows the slope is not exactly zero. We judge the result by its size and confidence interval instead.
+
+## 2.2 Question 2: Can we get the same slope and intercept by hand?
+
+`lm()` uses ordinary least squares. The slope is the covariance of x and y divided by the variance of x, and the intercept makes the line pass through the point of means.
+
+```{r}
+#| label: by-hand
+x <- ej$poc10
+y <- ej$log_dsl
+
+mean_x <- mean(x); mean_y <- mean(y)                           # Step 1: means
+
+numerator   <- sum((x - mean_x) * (y - mean_y))                # Step 2: how x and y move together
+denominator <- sum((x - mean_x)^2)                             # Step 3: how much x varies
+beta_1 <- numerator / denominator                              # Step 4: slope
+beta_0 <- mean_y - beta_1 * mean_x                             # Step 5: intercept
+
+y_hat <- beta_0 + beta_1 * x                                   # predicted values
+rss   <- sum((y - y_hat)^2)                                    # residual sum of squares
+tss   <- sum((y - mean_y)^2)                                   # total sum of squares
+rse   <- sqrt(rss / (length(y) - 2))                           # residual standard error
+r2    <- 1 - rss / tss                                         # R^2
+
+data.frame(
+  quantity = c("Intercept", "Slope", "R squared", "RSE"),
+  by_hand  = round(c(beta_0, beta_1, r2, rse), 5),
+  from_lm  = round(c(coef(m1), fit_stats(m1)[c("r_squared", "rse")]), 5)
+)
+```
+
+**Understanding the output:** the hand calculation and `lm()` agree to every decimal place. Nothing about regression is hidden: the slope is how much log diesel PM moves with % people of color, scaled by how spread out % people of color is.
+
+## 2.3 Question 3: How uncertain is the slope?
+
+```{r}
+#| label: simple-ci
+se_beta_1 <- rse / sqrt(denominator)                           # standard error of the slope
+
+data.frame(
+  method   = c("By hand (± 2 SE)", "confint()"),
+  low_pct  = round(to_pct_change(c(beta_1 - 2 * se_beta_1, confint(m1)["poc10", 1])), 2),
+  high_pct = round(to_pct_change(c(beta_1 + 2 * se_beta_1, confint(m1)["poc10", 2])), 2)
+)
+```
+
+**Understanding the output:** the 95% confidence interval for the slope is about **10.4% to 10.8%** per 10 points. It is extremely narrow because there are 84,222 tracts. That narrowness assumes every tract is an independent piece of evidence, an assumption Section 6.2 shows is false.
+
+```{r}
+#| label: fig-simple
+#| fig-cap: "Each hexagon counts tracts; the line is the simple regression with its 95% confidence band. Diesel PM on a log scale. 84,222 tracts."
+ggplot(ej, aes(pct_poc, DSLPM)) +
+  geom_hex(bins = 60) +
+  geom_smooth(method = "lm", colour = "firebrick") +           # the fitted simple regression
+  scale_y_log10() +
+  scale_fill_viridis_c(trans = "log10", name = "Tracts") +
+  labs(title = "Tracts with more residents of color have higher modelled diesel PM",
+       x = "Residents who are people of color (%)",
+       y = "Modelled diesel PM (µg/m³, log scale)")
+```
+
+# 3 Models 2–4: Multiple Linear Regression
+
+> **Models tested:** `m2` adds density, `m3` adds income, `m4` adds EPA region. `m4` is the main linear model.
+
+## 3.1 Question 4: What happens to the people-of-color coefficient as each predictor enters?
+
+Add density, then income, then geographic location, one at a time. Predict whether the `poc10` coefficient will grow, shrink, or stay put at each step.
+
+```{r}
+#| label: stepwise
+m2 <- lm(log_dsl ~ poc10 + log_density,                     data = ej)   # + density
+m3 <- lm(log_dsl ~ poc10 + log_density + lowinc10,          data = ej)   # + income
+m4 <- lm(log_dsl ~ poc10 + log_density + lowinc10 + region, data = ej)   # + geography
+
+models <- list("1. People of color only" = m1,
+               "2. + density"            = m2,
+               "3. + income"             = m3,
+               "4. + EPA region"         = m4)
+
+steps <- do.call(rbind, lapply(names(models), function(nm) {
+  m  <- models[[nm]]
+  ci <- coefci(m, vcov. = vcovCL(m, cluster = ej$county))["poc10", ]
+  data.frame(model          = nm,
+             poc_pct        = round(to_pct_change(coef(m)["poc10"]), 1),
+             clustered_low  = round(to_pct_change(ci[1]), 1),
+             clustered_high = round(to_pct_change(ci[2]), 1),
+             r_squared      = round(fit_stats(m)["r_squared"], 3),
+             adj_r_squared  = round(fit_stats(m)["adj_r_squared"], 3),
+             rse            = round(fit_stats(m)["rse"], 3),
+             row.names = NULL)
+}))
+steps
+```
+
+**Understanding the output:**
+
+Nothing about the data changes between these four models. The same 84,222 tracts, the same outcome. **Only the question changes.**
+
+- **Model 1** asks: among all tracts, do those with more residents of color have more diesel PM? Yes: **10.6%** more per 10 points (clustered 95% CI: 8.7% to 12.6%).
+- **Model 2** asks: among tracts with the **same density**, do they? Barely: **0.8%** (CI: −0.4% to 2.0%), and the interval includes zero. Density accounts for nearly all of the simple association, and R² jumps from 0.158 to 0.614.
+- **Model 3** adds **income**, and the coefficient *rises* to **2.5%** (CI: 1.2% to 3.9%). This is **suppression**: tracts with more residents of color tend to be lower-income, and if lower-income tracts have slightly less diesel PM at the same density, leaving income out pulled the people-of-color coefficient down. Holding income fixed reveals an association that density alone had masked. Section 3.2 confirms it: the `lowinc10` coefficient is negative (−5.1%).
+- **Model 4** adds **EPA region**: **2.9%** (CI: 1.9% to 3.8%).
+
+That phrase, **holding the other predictors constant**, is the entire meaning of a multiple regression coefficient. It is not a caveat attached to the interpretation. It is the interpretation. Adding a predictor can shrink a coefficient, as density did, or reveal one, as income did.
+
+**Fit.** R² rises from 0.158 to 0.614 to 0.625 to 0.642, with nearly all the gain from density. Adjusted R² equals R² to three decimals because the sample is so large, and it rises at every step, so each predictor earns its place. The residual standard error falls from 0.304 to 0.198: a typical miss shrinks from a factor of about 10^0.304 ≈ 2.0 to about 10^0.198 ≈ 1.6.
+
+**What "explained by density" does not mean.** It does not mean race is irrelevant. Where people of color live, and where highways and freight routes were built, were shaped by policies such as redlining and highway siting. Adjusting for density can hide that history as much as explain the gap.
+
+## 3.2 Question 5: How do we read every coefficient in the full model?
+
+```{r}
+#| label: full-coefs
+coef_table(m4)
+```
+
+**Reading the columns:** `estimate` is on the log10 scale; `pct_change` converts it; `clustered_low`/`clustered_high` are the 95% confidence interval; `t_value` is the estimate divided by its clustered standard error (how many standard errors it sits from zero); `p_value` is the chance of a t that large if the true effect were zero. With 84,222 tracts nearly every p-value is tiny, so the interpretation below rests on the size and interval, not the p-value.
+
+**Understanding the output:** each sentence uses "holding constant" and states units.
+
+- **`poc10`:** holding density, income, and region constant, 10 more percentage points of residents of color is associated with **2.9%** more modelled diesel PM (clustered 95% CI: 1.9% to 3.8%).
+- **`log_density`:** a one-unit increase is a **tenfold** increase in density. Holding demographics, income, and region constant, a tract ten times denser has **84.2%** more diesel PM (CI: 79.4% to 89.1%), almost double. Density is by far the strongest predictor.
+- **`lowinc10`:** holding the others constant, 10 more points of low-income residents is associated with **5.1% less** diesel PM (CI: −6.2% to −4.1%). This negative coefficient confirms the suppression seen in 3.1: tracts with more residents of color tend to be lower-income, and lower-income tracts have slightly less diesel PM at the same density, so leaving income out pulled the people-of-color coefficient down. Income on its own does not drive the gap.
+- **Region terms** are comparisons with **Region 1 (New England)**. Holding demographics, density, and income constant, every region has more diesel PM than New England, from **9.5%** more in Mountains & Plains (CI: −5.6% to 27.1%, which includes zero) to **50.5%** more in the Pacific Northwest (CI: 27.3% to 78.0%). Section 5.1 gives the full list.
+- **The intercept** is **−1.640**, a predicted 10^−1.64 ≈ **0.023 µg/m³** for a tract with 0% residents of color, 1 person per km², and 0% low income in New England. That tract barely exists, so this intercept is an **extrapolation** with no practical meaning. (The −97.7% in the `pct_change` column is meaningless for an intercept.) Section 4.2 fixes that.
+
+# 4 Checking Model 4: Correlated Predictors and a Centered Version
+
+> **Models tested:** the VIF regressions (each predictor on the others) and `m4c`, the same model with centered predictors.
+
+## 4.1 Question 6: Are the predictors too correlated to separate?
+
+```{r}
+#| label: correlations
+round(cor(ej[, c("pct_poc", "pct_lowinc", "log_density")]), 2)
+```
+
+```{r}
+#| label: vif
+vif_manual <- function(predictor, others, data) {                 # variance inflation factor
+  fit <- lm(as.formula(paste(predictor, "~", paste(others, collapse = " + "))), data = data)
+  1 / (1 - summary(fit)$r.squared)                                # inflation in the coefficient's variance
+}
+
+num_preds <- c("poc10", "log_density", "lowinc10")
+data.frame(
+  predictor = num_preds,
+  vif = round(sapply(num_preds, function(v)
+    vif_manual(v, c(setdiff(num_preds, v), "region"), ej)), 2),   # others include region
+  row.names = NULL
+)
+```
+
+**Understanding the output:** correlations are moderate: % people of color with % low income **0.45**, with density **0.48**; income with density only **0.05**. A VIF asks how well the other predictors can predict this one; values above 5 deserve attention and above 10 mean the model cannot tell predictors apart. Our VIFs are **1.38 to 2.01**, well below 5, so the individual coefficients are trustworthy. `poc10` has the highest VIF (2.01) because it is linked to both income and density, which widens its standard error by about √2.01 ≈ 1.4 times; that cost is already reflected in its confidence interval. Income and density are nearly unrelated, so they account for different parts of the people-of-color association, and the suppression seen in 3.1 is a real pattern rather than a side effect of overlapping predictors.
+
+## 4.2 Question 7: Can we make the intercept mean something?
+
+Center each numeric predictor at its average, so that zero means "a typical tract."
+
+```{r}
+#| label: centered
+ej <- ej %>%
+  mutate(poc10_c       = poc10       - mean(poc10),            # 0 = average % people of color
+         log_density_c = log_density - mean(log_density),      # 0 = average (log) density
+         lowinc10_c    = lowinc10    - mean(lowinc10))         # 0 = average % low income
+
+m4c <- lm(log_dsl ~ poc10_c + log_density_c + lowinc10_c + region, data = ej)
+
+data.frame(
+  model       = c("Uncentered", "Centered"),
+  intercept   = round(c(coef(m4)[1], coef(m4c)[1]), 4),
+  intercept_ugm3 = round(10^c(coef(m4)[1], coef(m4c)[1]), 3),
+  poc_slope   = round(c(coef(m4)["poc10"], coef(m4c)["poc10_c"]), 5),
+  same_predictions = c(NA, isTRUE(all.equal(fitted(m4), fitted(m4c)))),
+  row.names = NULL
+)
+```
+
+**Understanding the output:** the slopes are **identical** (0.0123) and so are all predictions. Only the intercept changed. Uncentered, the intercept describes a tract with 0% residents of color, 1 person per km², and 0% low income, which does not exist, so its prediction of 0.023 µg/m³ has no practical meaning. In the centered model, the intercept is the predicted diesel PM for a tract with **average** demographics, density, and income in the reference region (New England): about **0.113 µg/m³**, a realistic value, somewhat below the national median of 0.156 because every other region has more diesel PM than New England at the same characteristics. Centering changes what the intercept describes, not what the model says.
+
+# 5 Model 5: Geography (EPA Region)
+
+> **Models tested:** `m4` read as a categorical model, `m4_rl` with a different reference region, `m5` with a region × people-of-color interaction, and one model fit separately inside each region.
+
+## 5.1 Question 8: How does a predictor with no numeric meaning enter the model?
+
+EPA region is a label. Region 9 is not "nine times" Region 1. Predict how R handles it.
+
+EPA divides the country into ten regions, each run by a regional office (U.S. EPA, *Regional and Geographic Offices*). EJScreen records only the region **number**; the names below are our shorthand for each office's area.
+
+| Region | States in EPA's definition | In our data |
+|---|---|---|
+| 1 New England (Boston) | CT, ME, MA, NH, RI, VT | Same |
+| 2 NY/NJ/PR (New York City) | NJ, NY, Puerto Rico, U.S. Virgin Islands | NJ, NY, Puerto Rico (no Virgin Islands) |
+| 3 Mid-Atlantic (Philadelphia) | DE, DC, MD, PA, VA, WV | Same |
+| 4 Southeast (Atlanta) | AL, FL, GA, KY, MS, NC, SC, TN | Same |
+| 5 Great Lakes (Chicago) | IL, IN, MI, MN, OH, WI | Same |
+| 6 South Central (Dallas) | AR, LA, NM, OK, TX | Same |
+| 7 Central Plains (Kansas City) | IA, KS, MO, NE | Same |
+| 8 Mountains & Plains (Denver) | CO, MT, ND, SD, UT, WY | Same |
+| 9 Pacific Southwest (San Francisco) | AZ, CA, HI, NV, Pacific territories | AZ, CA, HI, NV (no territories) |
+| 10 Pacific Northwest (Seattle) | AK, ID, OR, WA | **ID, OR, WA (no Alaska)** |
+
+Because Alaska and the territories have no diesel estimates, Regions 2, 9, and 10 are smaller in our data than EPA's official regions. Region 10 is most affected: without Alaska it loses most of its land area and most of the 271 tribes EPA lists for it.
+
+```{r}
+#| label: region-check
+# Check which states the data actually places in each region
+ej %>%
+  group_by(region) %>%
+  summarise(states = paste(sort(unique(ST_ABBREV)), collapse = ", "), tracts = n())
+```
+
+```{r}
+#| label: region-levels
+levels(ej$region)                                  # the 10 categories, in order
+table(ej$region)                                   # tracts in each
+```
+
+```{r}
+#| label: region-coefs
+coef_table(m4) %>% filter(grepl("region", term))   # region terms from the full model
+```
+
+**Understanding the output:** ten regions produced **nine** coefficients. R used the first level, **Region 1 (New England)**, as the **reference** and created a yes/no indicator for each other region. Every region coefficient is a comparison with New England, **holding demographics, density, and income constant**. Every region has more modelled diesel PM than New England, ranging from **9.5%** more in Region 8 (Mountains & Plains; 95% CI: −5.6% to 27.1%, which includes zero) to **50.5%** more in Region 10 (Pacific Northwest; CI: 27.3% to 78.0%), with the Central Plains (**46.5%**) and Great Lakes (**44.3%**) close behind. Several intervals are wide, especially in Regions 2, 9, and 10, because each mixes very different counties. Region 10 excludes Alaska. Adding region raised R² from 0.625 to 0.642 but moved the people-of-color coefficient only from 2.5% to 2.9%: geography shifts the overall level of diesel PM, but it does not explain away the demographic gap.
+
+A region with no coefficient has not been dropped. It is the baseline the others are measured against.
+```{r}
+#| label: fig-region-coefs
+#| fig-cap: "Percent difference in modelled diesel PM for each EPA region compared with New England (the reference), holding % people of color, density, and income constant (model m4). Bars are point estimates; black lines are 95% county-clustered confidence intervals. The dashed line at 0 means no difference from New England."
+#| fig-width: 9
+#| fig-height: 5.5
+region_plot <- coef_table(m4) %>%
+  filter(grepl("region", term)) %>%                                  # keep only the 9 region terms
+  mutate(region     = sub("^region", "", term),                      # "region10 Pacific Northwest" -> "10 Pacific Northwest"
+         includes_0 = clustered_low <= 0)                            # TRUE if the CI crosses zero
+
+ggplot(region_plot, aes(x = pct_change, y = reorder(region, pct_change))) +
+  geom_col(aes(fill = includes_0), width = 0.65) +                   # one bar per region
+  geom_errorbarh(aes(xmin = clustered_low, xmax = clustered_high),   # clustered 95% CI
+                 height = 0.25, colour = "grey20") +
+  geom_text(aes(x = clustered_high, label = paste0(pct_change, "%")),
+            hjust = -0.25, size = 3.6) +                             # value printed past the CI
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  scale_fill_manual(values = c(`FALSE` = "firebrick", `TRUE` = "grey65"),
+                    labels = c(`FALSE` = "Interval above zero", `TRUE` = "Interval includes zero"),
+                    name = NULL) +
+  scale_x_continuous(expand = expansion(mult = c(0.05, 0.12))) +     # room for the labels
+  labs(title = "Every region has more diesel PM than New England",
+       x = "% difference in diesel PM vs. New England (same demographics, density, and income)",
+       y = NULL) +
+  theme(legend.position = "bottom")
+```
+
+
+## 5.2 Question 9: Does the choice of reference region change anything?
+
+Make the largest region the reference and refit.
+
+```{r}
+#| label: relevel
+ref_region <- names(which.max(table(ej$region)))                 # region with the most tracts
+ej_rl <- ej %>% mutate(region = relevel(region, ref = ref_region))   # make it the reference
+m4_rl <- lm(log_dsl ~ poc10 + log_density + lowinc10 + region, data = ej_rl)   # same model, new reference
+
+# 1. Quick checks
+data.frame(
+  check = c("New reference region",
+            "poc10 coefficient, original",
+            "poc10 coefficient, releveled",
+            "Same predictions?"),
+  value = c(ref_region,
+            round(coef(m4)["poc10"], 5),
+            round(coef(m4_rl)["poc10"], 5),
+            isTRUE(all.equal(fitted(m4), fitted(m4_rl))))       # TRUE = identical fitted values
+)
+
+# 2. Every coefficient in the releveled model: estimate, % change, clustered CI, t, p
+coef_table(m4_rl)
+
+# 3. Non-region coefficients side by side: these should not change
+coef_table(m4) %>%
+  filter(!grepl("region", term)) %>%                            # intercept, poc10, density, income
+  dplyr::select(term, original_pct = pct_change, original_t = t_value) %>%
+  left_join(coef_table(m4_rl) %>%
+              filter(!grepl("region", term)) %>%
+              dplyr::select(term, releveled_pct = pct_change, releveled_t = t_value),
+            by = "term")
+# 4. Fit statistics for both models: should be identical
+rbind("Original (New England reference)" = round(fit_stats(m4), 4),
+      "Releveled (Southeast reference)"  = round(fit_stats(m4_rl), 4))
+```
+
+**Understanding the output:** making **Region 4 (Southeast)**, the region with the most tracts, the reference changed the **region** coefficients and the intercept, because they are now comparisons with the Southeast instead of New England. For example, New England now shows about 22.5% *less* diesel PM than the Southeast, and the Pacific Northwest about 16.7% *more*, the same gaps as before measured from a different starting point. The `poc10` coefficient (0.0123), the density and income coefficients, and every prediction are **identical**. The reference level is a choice of what to compare against, not a change to the model.
+
+## 5.3 Question 10: Does the people-of-color association differ by region?
+
+Every model so far assumes one people-of-color slope for the whole country. This tests whether the national pattern holds everywhere or is driven by a few regions.
+
+```{r}
+#| label: interaction
+m5 <- lm(log_dsl ~ poc10 * region + log_density + lowinc10, data = ej)   # * = main effects + interaction
+
+coef_table(m5) %>% filter(grepl("poc10", term))                           # the slope terms
+```
+
+**Understanding the output:** the `*` operator fits a separate people-of-color slope for each region. The `poc10` term is the slope in the reference region, **New England: 5.2%** more diesel PM per 10 points (clustered 95% CI: 3.2% to 7.2%). Each `poc10:region` term is how much that region's slope differs from New England's. Adding them gives region-specific slopes ranging from about **0%** in NY/NJ/PR and the South Central region to **9.1%** in Mountains & Plains and **10.5%** in the Pacific Northwest. The association is strongest in the West and weakest in the Mid-Atlantic, Central Plains, NY/NJ/PR, and South Central regions, where the interaction terms are significantly negative. The national estimate of 2.9% is a compromise that is too low for the West and too high elsewhere. A region's overall level of diesel PM and the steepness of its demographic gradient are different things: Mountains & Plains has among the lowest levels but one of the steepest slopes. Each region's own slope and interval are in the next table.
+
+```{r}
+#| label: region-slopes
+region_slopes <- do.call(rbind, lapply(levels(ej$region), function(lv) {
+  d  <- ej[ej$region == lv, ]                                          # tracts in this region only
+  m  <- lm(log_dsl ~ poc10 + log_density + lowinc10, data = d)         # full model within the region
+  ci <- coefci(m, vcov. = vcovCL(m, cluster = d$county))["poc10", ]    # clustered CI
+  data.frame(region   = lv,
+             tracts   = nrow(d),
+             poc_pct  = round(to_pct_change(coef(m)["poc10"]), 1),
+             ci_low   = round(to_pct_change(ci[1]), 1),
+             ci_high  = round(to_pct_change(ci[2]), 1),
+             row.names = NULL)
+}))
+region_slopes
+```
+
+```{r}
+#| label: fig-region-slopes
+#| fig-cap: "Percent change in modelled diesel PM per 10 more percentage points of residents of color, estimated separately in each EPA region, holding density and income constant. Bars are 95% county-clustered confidence intervals. The dashed line is the national estimate (2.9%); the dotted line is zero."
+national <- to_pct_change(coef(m4)["poc10"])
+
+ggplot(region_slopes, aes(x = poc_pct, y = reorder(region, poc_pct))) +
+  geom_vline(xintercept = 0, linetype = "dotted", colour = "grey50") +
+  geom_vline(xintercept = national, linetype = "dashed", colour = "firebrick") +
+  geom_errorbarh(aes(xmin = ci_low, xmax = ci_high), height = 0.2) +
+  geom_point(size = 3) +
+  labs(title = "The people-of-color association differs by region",
+       x = "% change in diesel PM per +10 points residents of color",
+       y = NULL)
+```
+
+```{r}
+#| label: interaction-test
+anova(m4, m5)                                                        # does the interaction earn its terms?
+
+data.frame(
+  model         = c("One national slope (m4)", "Slope varies by region (m5)"),
+  adj_r_squared = round(c(fit_stats(m4)["adj_r_squared"], fit_stats(m5)["adj_r_squared"]), 4)
+)
+```
+
+**Understanding the output:** estimated separately within each region, holding density and income constant, the association between % people of color and diesel PM is positive with an interval above zero in **7 of 10 regions**, so the national pattern is not driven by a few places. It is strongest in **Mountains & Plains (9.0%; 95% CI: 5.2% to 12.9%)** and the **Pacific Northwest (8.5%; CI: 5.5% to 11.6%)**, roughly three times the national 2.9%, and essentially **zero in NY/NJ/PR (0.0%; CI: −2.1% to 2.2%)** and the **South Central region (−0.5%; CI: −3.2% to 2.2%)**. The Pacific Southwest is uncertain (3.8%; CI: −0.7% to 8.5%). Some middle regions differ from the interaction model because these fits also let density and income work differently in each region; the strongest and weakest regions agree across both approaches. Without allowing for regional differences, the model is forced to report a single compromise slope of 2.9% that is too low in some regions and too high in others.
+
+Letting the slope vary by region adds **9 terms** and reduces the residual sum of squares from **3300.4 to 3229.0** (about 2.2%). The `anova()` F statistic is **206.9** (p < 2.2 × 10⁻¹⁶), but **keep the scale in view**: adjusted R² rises only from **0.6420 to 0.6497**, less than one percentage point. With 84,222 tracts, a statistically decisive result can still be small. (The F-test also assumes tracts are independent, so it overstates the evidence, though not enough to change the conclusion.) The regional differences matter not because they improve overall fit, but because of what they say about who is affected: a 9% gradient in some regions and none in others.
+
+# 6 Diagnostics for the Linear Models
+
+> **What is tested:** whether `m4` meets the regression assumptions, and what clustering by county does to its confidence intervals.
+
+## 6.1 Question 11: Do the assumptions hold?
+
+```{r}
+#| label: fig-diagnostics
+#| fig-cap: "Standard diagnostic plots for the full model (m4)."
+#| fig-width: 8
+#| fig-height: 7
+par(mfrow = c(2, 2))   # 2 x 2 grid
+plot(m4)               # residuals vs fitted, Q-Q, scale-location, leverage
+```
+
+```{r}
+#| label: fig-resid-region
+#| fig-cap: "Residuals of the full model by EPA region. Boxes centred on zero mean the model fits that region about as well as any other."
+data.frame(region = ej$region, residual = resid(m4)) %>%
+  ggplot(aes(x = residual, y = region)) +
+  geom_vline(xintercept = 0, colour = "firebrick") +
+  geom_boxplot(outlier.alpha = 0.05) +
+  labs(title = "Is the model equally accurate everywhere?",
+       x = "Residual (log10 diesel PM)", y = NULL)
+```
+
+**Understanding the output:**
+
+- **Linearity** (Residuals vs Fitted): the red line is mostly flat, bending up slightly at the highest fitted values. A linear model is reasonable.
+- **Constant variance** (Scale-Location): residuals spread out somewhat more for tracts with the highest predicted diesel PM, so ordinary standard errors may be a little too small.
+- **Normality** (Q-Q): heavier tails than a normal distribution at both ends. With 84,222 tracts this has little effect on the coefficients.
+- **Influential points** (Leverage): leverage values are tiny and no tract approaches Cook's distance, so no single tract drives the result.
+- **By region:** the medians are close to zero in every region, so the model is not systematically off for the typical tract anywhere. But the fit is uneven. The boxes are wider, and the medians slightly above zero, in **NY/NJ/PR, Mountains & Plains, the Pacific Southwest, and the Pacific Northwest**, and NY/NJ/PR and the Pacific Southwest have long lower tails: many tracts with 10 to 30 times less diesel PM than predicted, likely remote areas such as rural upstate New York, Puerto Rico, and the desert Southwest. The Mid-Atlantic, Southeast, Great Lakes, Central Plains, and New England fit most tightly. Regions that mix dense cities with very remote areas are fit least well by one national model, which is consistent with their wider confidence intervals and with the regional differences found in 5.3.
+- **Independence:** fails. Neighboring tracts share highways, freight corridors, and the same air-model inputs, so their errors are related. The plots cannot show this; the next section measures its consequence.
+
+## 6.2 Question 12: What happens to the intervals when nearby tracts are allowed to be related?
+
+```{r}
+#| label: clustered
+ci_ord <- confint(m4)["poc10", ]                                          # assumes independence
+ci_clu <- coefci(m4, vcov. = vcovCL(m4, cluster = ej$county))["poc10", ]  # allows tracts in a county to be related
+
+data.frame(
+  method   = c("Ordinary", "Clustered by county"),
+  estimate = round(to_pct_change(coef(m4)["poc10"]), 1),
+  ci_low   = round(to_pct_change(c(ci_ord[1], ci_clu[1])), 1),
+  ci_high  = round(to_pct_change(c(ci_ord[2], ci_clu[2])), 1)
+)
+```
+
+**Understanding the output:** the estimate does not change: **2.9%**. The interval widens from **2.7%–3.0%** to **1.9%–3.8%**, about **six times wider**. Ordinary intervals treated all 84,222 tracts as independent evidence, but tracts in a county share roads and model inputs, so there is far less independent information. The honest interval is wider, and it is still entirely above zero. We report clustered intervals throughout.
+
+## 6.3 Summary figure
+
+```{r}
+#| label: fig-steps
+#| fig-cap: "Percent change in modelled diesel PM per 10 more percentage points of residents of color as each predictor is added. Bars are 95% county-clustered confidence intervals. 84,222 tracts."
+steps %>%
+  mutate(model = factor(model, levels = rev(model))) %>%
+  ggplot(aes(x = poc_pct, y = model)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_errorbarh(aes(xmin = clustered_low, xmax = clustered_high), height = 0.15) +
+  geom_point(size = 3, colour = "firebrick") +
+  geom_text(aes(label = paste0(poc_pct, "%")), vjust = -1.1, size = 3.5) +
+  labs(title = "Density, income, and region explain most of the gap",
+       x = "% change in diesel PM per +10 points residents of color", y = NULL)
+```
+
+# 7 Effect Sizes, p-Values, and Power
+
+> **Models tested:** `m4z` (standardized `m4`), `m4` with each predictor dropped in turn (for f²), and `m5` vs. `m4` (for region's f²).
+
+## 7.1 Question 13: How big are these effects, on scales we can compare?
+
+A coefficient's size depends on its units: 2.9% per 10 points of residents of color and 84% per tenfold increase in density cannot be compared directly. Effect sizes put predictors on common scales. We use four.
+
+1. **Standardized coefficients (β):** how many standard deviations log diesel PM moves when a predictor moves one standard deviation, holding the others constant.
+2. **Cohen's f²:** how much of the remaining unexplained variation each predictor accounts for, compared with the full model without it. Conventional benchmarks: 0.02 small, 0.15 medium, 0.35 large.
+3. **Region's contribution:** f² for region as a category and for its interaction with % people of color, plus the size of regional differences in real units.
+4. **An interquartile comparison in real units:** the predicted difference in diesel PM between a typical tract at the 25th and 75th percentile of % people of color, holding everything else constant.
+
+```{r}
+#| label: effect-standardized
+num_vars <- c("poc10", "log_density", "lowinc10")
+
+ej_z <- ej %>%
+  mutate(across(all_of(c("log_dsl", num_vars)),
+                ~ as.numeric(scale(.x)), .names = "{.col}_z"))           # mean 0, SD 1
+
+m4z  <- lm(log_dsl_z ~ poc10_z + log_density_z + lowinc10_z + region, data = ej_z)
+ci_z <- coefci(m4z, vcov. = vcovCL(m4z, cluster = ej_z$county))        # clustered CIs
+
+data.frame(predictor = c("% people of color", "Log density", "% low income"),
+           std_beta  = round(coef(m4z)[paste0(num_vars, "_z")], 3),
+           ci_low    = round(ci_z[paste0(num_vars, "_z"), 1], 3),
+           ci_high   = round(ci_z[paste0(num_vars, "_z"), 2], 3),
+           row.names = NULL)
+```
+```{r}
+#| label: fig-effect-standardized
+#| fig-cap: "Standardized coefficients from the full model (m4z): how many standard deviations log diesel PM changes when each predictor rises by one standard deviation, holding the others and EPA region constant. Black lines are 95% county-clustered confidence intervals. The dashed line at 0 means no association."
+#| fig-width: 8
+#| fig-height: 4
+std_tab <- data.frame(
+  predictor = c("% people of color", "Log density", "% low income"),
+  std_beta  = coef(m4z)[paste0(num_vars, "_z")],                       # standardized coefficients
+  ci_low    = ci_z[paste0(num_vars, "_z"), 1],                         # clustered CI, lower
+  ci_high   = ci_z[paste0(num_vars, "_z"), 2],                         # clustered CI, upper
+  row.names = NULL
+)
+
+ggplot(std_tab, aes(x = std_beta, y = reorder(predictor, std_beta))) +
+  geom_col(aes(fill = std_beta > 0), width = 0.55, show.legend = FALSE) +   # red = negative, grey = positive
+  geom_errorbarh(aes(xmin = ci_low, xmax = ci_high), height = 0.2, colour = "grey20") +
+  geom_text(aes(x = ifelse(std_beta > 0, ci_high, ci_low),                  # label just past the CI
+                label = sprintf("%.3f", std_beta),
+                hjust = ifelse(std_beta > 0, -0.3, 1.3)), size = 4) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  scale_fill_manual(values = c(`TRUE` = "grey45", `FALSE` = "firebrick")) +
+  scale_x_continuous(limits = c(-0.25, 0.9)) +                             # room for the labels on both sides
+  labs(title = "Density's effect is about 6.7 times larger than race's",
+       x = "Standardized coefficient (SDs of log diesel PM per 1 SD of the predictor)",
+       y = NULL)
+```
+
+```{r}
+#| label: effect-f2
+r2_full <- summary(m4)$r.squared
+
+f2 <- sapply(c("poc10", "log_density", "lowinc10", "region"), function(v) {
+  reduced <- update(m4, as.formula(paste(". ~ . -", v)))                 # full model without this predictor
+  (r2_full - summary(reduced)$r.squared) / (1 - r2_full)                 # Cohen's f^2
+})
+
+data.frame(predictor = c("% people of color", "Log density", "% low income", "EPA region"),
+           cohens_f2 = round(f2, 4),
+           size      = cut(f2, c(-Inf, 0.02, 0.15, 0.35, Inf),
+                           labels = c("below small", "small", "medium", "large")),
+           row.names = NULL)
+```
+
+```{r}
+#| label: effect-region
+r2_m4 <- summary(m4)$r.squared
+r2_m5 <- summary(m5)$r.squared
+region_pct <- c(0, coef_table(m4) %>% filter(grepl("^region", term)) %>% pull(pct_change))   # 0 = New England (reference)
+
+data.frame(
+  quantity = c("Cohen's f², region shifting the level of diesel PM",
+               "Cohen's f², region changing the people-of-color slope (interaction)",
+               "Largest gap between regions, same demographics/density/income (%)",
+               "Range of region-specific people-of-color slopes (% per +10 points)"),
+  value    = c(round(f2["region"], 4),
+               round((r2_m5 - r2_m4) / (1 - r2_m5), 4),
+               round(max(region_pct) - min(region_pct), 1),
+               paste(min(region_slopes$poc_pct), "to", max(region_slopes$poc_pct)))
+)
+```
+
+```{r}
+#| label: effect-iqr
+q <- quantile(ej$pct_poc, c(0.25, 0.75))                                 # typical low and high % people of color
+gap10 <- (q[2] - q[1]) / 10                                              # the gap, in units of 10 points
+
+ci_s <- coefci(m1, vcov. = vcovCL(m1, cluster = ej$county))["poc10", ]
+ci_m <- coefci(m4, vcov. = vcovCL(m4, cluster = ej$county))["poc10", ]
+base <- 10^coef(m4c)[1]                                                  # typical tract, reference region (4.2)
+
+data.frame(
+  model      = c("Simple (m1)", "Adjusted (m4)"),
+  pct_25th   = round(q[1], 1), pct_75th = round(q[2], 1),
+  ratio      = round(10^(gap10 * c(coef(m1)["poc10"], coef(m4)["poc10"])), 3),
+  ratio_low  = round(10^(gap10 * c(ci_s[1], ci_m[1])), 3),
+  ratio_high = round(10^(gap10 * c(ci_s[2], ci_m[2])), 3),
+  extra_ugm3_typical_tract = round(base * (10^(gap10 * c(coef(m1)["poc10"], coef(m4)["poc10"])) - 1), 4),
+  row.names  = NULL
+)
+```
+
+**Understanding the output:**
+
+- **Standardized coefficients.** One standard deviation more residents of color goes with **0.111** standard deviations more log diesel PM (CI: 0.074 to 0.149), compared with **0.739** for density (CI: 0.707 to 0.770) and **−0.126** for income (CI: −0.153 to −0.100). Density's effect is roughly **6.7 times** larger than race's on this common scale. Race and income are similar in size but opposite in direction, the suppression seen in 3.1.
+- **Cohen's f².** Density has f² = **1.046** (*large*, three times the 0.35 benchmark); % people of color has f² = **0.017** (*just below small*); income **0.032** (*small*); region **0.046** (*small*). In variance terms, race explains only a sliver of what is left once density, income, and region are known.
+- **Geography.** Region is the second-strongest predictor after density (f² = **0.046**, small, but larger than income's 0.032 or race's 0.017). Holding demographics, density, and income constant, regions differ in diesel PM by up to about **50%** (the Pacific Northwest vs. New England). Region also changes the race gap itself: allowing the people-of-color slope to vary by region has f² = **0.022** (*small*, just above the 0.02 benchmark), and the region-specific slopes range from **−0.5% to 9.0%** per 10 points. In variance terms the interaction is small, but in substance it is large: the same demographic difference goes with no extra diesel PM in NY/NJ/PR and the South Central region, and about 9% more in Mountains & Plains and the Pacific Northwest.
+- **Interquartile comparison.** Moving from a tract at the 25th percentile of residents of color (**15%**) to one at the 75th (**64.4%**) multiplies predicted diesel PM by **1.65** in the simple model (95% CI: 1.51 to 1.79) and **1.15** after adjustment (CI: 1.10 to 1.21): about **65%** more before adjustment and **15%** more after. For a typical tract (about 0.113 µg/m³), that is roughly **0.073 µg/m³** more in the simple model and **0.017 µg/m³** more after adjustment.
+- **Why several measures?** A small f² and a modest standardized β do not make the gap unimportant. Effect sizes describe how much of the *variation across tracts* a predictor explains; the population-weighted exposure ratio from the main analysis (people of color live with **45%** more diesel PM, CI 33%–56%) describes how differently *groups of people* are affected. Both are true, and they answer different questions.
+
+## 7.2 Question 14: With 84,222 tracts, what do the p-value and the confidence interval tell us?
+
+Hypothesis testing asks whether a result could plausibly be chance if the null hypothesis (no association) were true. With a sample this large, the answer is almost always "no," so the p-value alone is uninformative. The more useful questions are how large the effect is, how precisely it is estimated, and how small an effect this study could have detected.
+
+```{r}
+#| label: power
+se_clu <- sqrt(diag(vcovCL(m4, cluster = ej$county)))["poc10"]          # clustered SE of the poc10 coefficient
+t_clu  <- coef(m4)["poc10"] / se_clu                                     # estimate in standard errors from zero
+p_clu  <- 2 * pnorm(-abs(t_clu))                                         # two-sided p-value
+mde    <- (qnorm(0.975) + qnorm(0.80)) * se_clu                          # minimum detectable effect, 80% power
+
+data.frame(
+  quantity = c("Estimate (% per +10 points)", "Clustered 95% CI (%)",
+               "Clustered standard error (log10)", "t statistic", "p-value",
+               "Smallest effect detectable with 80% power (% per +10 points)"),
+  value    = c(round(to_pct_change(coef(m4)["poc10"]), 2),
+               paste(round(to_pct_change(coef(m4)["poc10"] + c(-1, 1) * qnorm(0.975) * se_clu), 2), collapse = " to "),
+               signif(se_clu, 3), round(t_clu, 2), signif(p_clu, 3),
+               round(to_pct_change(mde), 2))
+)
+```
+
+**Understanding the output:**
+
+- **The test.** The null hypothesis is that, holding density, income, and region constant, % people of color is unrelated to diesel PM. The estimate (**2.87%**, clustered 95% CI 1.91% to 3.85%) sits **5.87** clustered standard errors from zero (p = **4.3 × 10⁻⁹**). Even with honest clustered errors, the result is far beyond what chance alone would produce.
+- **The confidence interval says more than the p-value.** The p-value only says the effect is probably not exactly zero. The interval, **1.9% to 3.8%**, says how large it plausibly is: small per 10 points, but clearly positive.
+- **Type I and Type II errors.** At α = 0.05, a true null would be wrongly rejected 5% of the time (Type I). Missing a real effect (Type II) is the bigger risk in small studies; here it is negligible.
+- **Power.** With clustered errors, this study had 80% power to detect an effect as small as **1.36%** per 10 points, about half the size of the effect we found. Almost any effect worth discussing would be detected, so "statistically significant" is nearly guaranteed and carries little information on its own. This is why every result in this analysis is reported as an effect size with a confidence interval rather than as a p-value (Wasserstein et al., 2019).
+
+# 8 Model 6: Logistic Regression
+
+> **Models tested:** `m_logit` (top 20% yes/no, same predictors as `m4`), the same model at four cutoffs, and `m_train` fit on 70% of counties and tested on the rest.
+
+## 8.1 Question 15: Is a tract in the top 20% nationally for diesel PM?
+
+The linear models ask *how much* diesel PM. EJScreen is used in practice as a yes/no screen: is a place at or above the 80th percentile? Logistic regression asks the same question in that form.
+
+**Why not linear regression for a yes/no outcome?** A straight line can predict values below 0 or above 1, which are impossible probabilities. Logistic regression models the **log-odds** instead, which can be any number, and converts back to a probability that always stays between 0 and 1:
+
+| Scale | Formula | Range |
+|---|---|---|
+| Log-odds (what the model is linear in) | log(p / (1 − p)) = β₀ + β₁x₁ + … | −∞ to ∞ |
+| Odds | p / (1 − p) = e^(log-odds) | 0 to ∞ |
+| Probability | p = 1 / (1 + e^(−log-odds)) | 0 to 1 |
+
+Exponentiating a coefficient gives an **odds ratio**; applying the full logistic transformation gives a **probability**. Mixing the two is the most common mistake.
+
+```{r}
+#| label: thresholds
+ej <- ej %>%
+  mutate(top20     = as.integer(P_DSLPM >= 80),                       # 1 = EPA percentile 80 or higher
+         top20_own = as.integer(DSLPM >= quantile(DSLPM, 0.80)))      # 1 = top 20% of OUR kept tracts
+
+ej %>%
+  summarise(share_tracts_flagged    = round(mean(top20), 3),          # share of tracts flagged
+            share_residents_flagged = round(weighted.mean(top20, ACSTOTPOP), 3),   # share of people
+            definitions_agree       = round(mean(top20 == top20_own), 3))
+```
+
+**Understanding the output:** **19.9%** of our tracts are flagged, holding **20%** of residents. The two definitions agree on **99.9%** of tracts, so using EPA's percentile or our own cutoff makes almost no difference. EJScreen's percentiles were computed over all areas, including ones we dropped, so the flagged share need not be exactly 20%.
+
+**Why the 80th percentile, and what it counts.** EPA chose it as an internal screening filter and says it is "not intended to designate an area as an 'EJ community.'" Percentiles are unweighted, so "top 20%" means the top 20% of **places**, not people.
+
+```{r}
+#| label: logistic
+m_logit <- glm(top20 ~ poc10 + log_density + lowinc10 + region,       # same predictors as m4
+               data = ej, family = binomial)
+
+vc_l <- vcovCL(m_logit, cluster = ej$county)                          # county-clustered standard errors
+ci_l <- coefci(m_logit, vcov. = vc_l)                                  # clustered CIs (log-odds scale)
+ct_l <- coeftest(m_logit, vcov. = vc_l)                                # clustered z statistics and p-values
+
+logit_table <- data.frame(term       = names(coef(m_logit)),
+                          log_odds   = round(coef(m_logit), 4),
+                          odds_ratio = round(exp(coef(m_logit)), 3),   # exp() turns log-odds into odds ratios
+                          ci_low     = round(exp(ci_l[, 1]), 3),
+                          ci_high    = round(exp(ci_l[, 2]), 3),
+                          z_value    = round(ct_l[, 3], 2),            # logistic models report z, not t
+                          p_value    = signif(ct_l[, 4], 3),
+                          row.names  = NULL)
+
+logit_table %>% filter(term %in% c("poc10", "log_density", "lowinc10"))
+```
+
+**Understanding the output:**
+
+- **How to read an odds ratio:** 1 means no association; above 1 means higher odds of being flagged; an interval that includes 1 cannot rule out no association.
+- **`poc10`:** holding density, income, and region constant, each 10 more points of residents of color multiplies the odds of being in the top 20% by **1.18** (clustered 95% CI: 1.11 to 1.26; z = 5.25, p = 1.5 × 10⁻⁷). In plain language: *a tract that is 60% people of color has about 1.18 times the odds of being flagged as an otherwise similar tract that is 50% people of color*, or 18% higher odds.
+- **`log_density`:** a **tenfold** increase in density multiplies the odds by **20.0** (CI: 14.2 to 28.2). Density is by far the strongest predictor of being flagged, as in the linear models.
+- **`lowinc10`:** **0.89** (CI: 0.82 to 0.96): 10 more points of low-income residents goes with about **11% lower** odds of being flagged, holding the others constant, the same suppression pattern as in the linear model.
+- Say "**times the odds**," not "times as likely": odds and probabilities are not the same.
+
+```{r}
+#| label: logistic-region
+logit_table %>% filter(grepl("^region", term))                         # each region vs. New England
+```
+```{r}
+#| label: fig-logistic-region
+#| fig-cap: "Odds ratio of a tract being in the national top 20% for diesel PM in each EPA region compared with New England (the reference), holding % people of color, density, and income constant (logistic model). Bars start at 1 (no difference); black lines are 95% county-clustered confidence intervals. Grey bars have intervals that include 1. The x-axis is on a log scale."
+#| fig-width: 9
+#| fig-height: 5.5
+or_plot <- logit_table %>%
+  filter(grepl("^region", term)) %>%                                   # the 9 region terms
+  mutate(region     = sub("^region", "", term),                        # "region10 Pacific Northwest" -> "10 Pacific Northwest"
+         includes_1 = ci_low <= 1)                                     # TRUE if the CI crosses 1
+
+ggplot(or_plot, aes(y = reorder(region, odds_ratio))) +
+  geom_linerange(aes(xmin = 1, xmax = odds_ratio, colour = includes_1), # bar from 1 to the odds ratio
+                 linewidth = 9) +
+  geom_errorbarh(aes(xmin = ci_low, xmax = ci_high), height = 0.25, colour = "grey20") +
+  geom_text(aes(x = ci_high, label = sprintf("%.1f", odds_ratio)), hjust = -0.3, size = 3.6) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey40") +
+  scale_x_log10(breaks = c(0.5, 1, 2, 5, 10, 20, 50),
+                expand = expansion(mult = c(0.02, 0.12))) +            # room for the labels
+  scale_colour_manual(values = c(`FALSE` = "firebrick", `TRUE` = "grey65"),
+                      labels = c(`FALSE` = "Interval above 1", `TRUE` = "Interval includes 1"),
+                      name = NULL) +
+  labs(title = "Pacific Northwest tracts have the highest odds of being in the top 20%",
+       x = "Odds ratio vs. New England (log scale)",
+       y = NULL) +
+  theme(legend.position = "bottom")
+```
+
+**Understanding the output (region):** each odds ratio compares a region with **New England**, holding demographics, density, and income constant. The odds of a tract being in the national top 20% for diesel PM are highest in the **Pacific Northwest (17.5 times; CI: 6.4 to 47.7)**, then the **Pacific Southwest (5.9; CI: 2.2 to 16.3)**, **Mountains & Plains (4.3; CI: 1.4 to 13.3)**, **NY/NJ/PR (3.7; CI: 1.4 to 9.8)**, **Great Lakes (3.6; CI: 1.2 to 11.3)**, and **Southeast (2.7; CI: 1.1 to 6.5)**. For the Mid-Atlantic (1.8), South Central (1.2), and Central Plains (1.6), the intervals include 1, so they cannot be distinguished from New England. The intervals are wide because few New England tracts are flagged, which makes it an imprecise baseline. The ordering broadly matches the linear region coefficients in 5.1, with the Pacific Northwest highest in both; the Central Plains is the exception, with a high average level (46.5% more than New England) but few tracts crossing the national top-20% line.
+
+## 8.2 Question 16: What do these odds mean for two real tracts?
+
+Take two tracts that are identical except for their share of residents of color: both in the Southeast (the region with the most tracts), at median density and average income. One is **40%** people of color, the other **60%**.
+
+```{r}
+#| label: logit-by-hand
+b <- coef(m_logit)
+med_dens <- median(ej$log_density)                                       # median log density
+avg_inc  <- mean(ej$lowinc10)                                            # average % low income (units of 10)
+
+# Step 1: log-odds for each tract, term by term
+lo_40 <- b["(Intercept)"] + b["poc10"] * 4 + b["log_density"] * med_dens +
+         b["lowinc10"] * avg_inc + b["region4 Southeast"]
+lo_60 <- lo_40 + b["poc10"] * 2                                          # 20 more points = 2 units of poc10
+
+# Step 2: convert log-odds to probability
+p_40 <- 1 / (1 + exp(-lo_40))
+p_60 <- 1 / (1 + exp(-lo_60))
+
+# Step 3: verify with predict()
+two_tracts <- data.frame(poc10 = c(4, 6), log_density = med_dens, lowinc10 = avg_inc,
+                         region = factor("4 Southeast", levels = levels(ej$region)))
+
+data.frame(tract       = c("40% people of color", "60% people of color"),
+           log_odds    = round(c(lo_40, lo_60), 3),
+           odds        = round(exp(c(lo_40, lo_60)), 3),
+           probability = round(c(p_40, p_60), 3),
+           predict_check = round(predict(m_logit, newdata = two_tracts, type = "response"), 3),
+           row.names   = NULL)
+```
+
+**Understanding the output:** the 40% tract has an **8.2%** predicted chance of being in the top 20% for diesel PM; the 60% tract has **11.0%**. The odds ratio between them is exp(2 × 0.1657) ≈ **1.39**, which equals the odds ratio per 10 points squared (1.18² ≈ 1.39). The hand calculation and `predict()` agree exactly. In plain language: two neighborhoods with the same density, income, and region, one 40% and one 60% people of color, differ in their predicted chance of being flagged by about **2.8 percentage points**, a 39% increase in odds but a modest change in probability, because both start low.
+
+## 8.3 Question 17: How do predicted probabilities change across the full range?
+
+```{r}
+#| label: fig-logit-curves
+#| fig-cap: "Predicted probability that a tract is in the top 20% nationally for diesel PM, by % residents of color, at three population densities. Income held at its average; region = Southeast. From the logistic model."
+dens_q <- quantile(ej$log_density, c(0.25, 0.50, 0.75))                  # low, typical, high density
+dens_lab <- paste0(c("25th", "50th", "75th"), " percentile density (",
+                   format(round(10^dens_q), big.mark = ","), " people/km²)")
+
+grid <- expand.grid(pct_poc = 0:100, d = 1:3) %>%
+  mutate(poc10       = pct_poc / 10,
+         log_density = dens_q[d],
+         density     = factor(dens_lab[d], levels = dens_lab),
+         lowinc10    = avg_inc,
+         region      = factor("4 Southeast", levels = levels(ej$region)))
+grid$prob <- predict(m_logit, newdata = grid, type = "response")
+
+ggplot(grid, aes(pct_poc, prob, colour = density)) +
+  geom_line(linewidth = 1.3) +
+  scale_y_continuous(labels = percent, limits = c(0, 1)) +
+  scale_colour_manual(values = c("#4682B4", "#DAA520", "#B22222")) +
+  labs(title = "Density sets the level; residents of color raise it at every density",
+       x = "Residents who are people of color (%)",
+       y = "Predicted probability of top 20% diesel PM",
+       colour = NULL) +
+  theme(legend.position = "bottom", legend.direction = "vertical")
+```
+
+**Understanding the output:** the three curves are parallel in log-odds but not in probability, because the logistic transformation compresses probabilities near 0 and 1. At **low density** (136 people/km²) the probability of being flagged stays near **0–2%** whatever the demographics. At **median density** (867 people/km²) it rises from about **4%** at 0% residents of color to about **19%** at 100%. At **high density** (2,098 people/km²) it rises from about **13%** to about **43%**. Density sets the level, and the demographic gap is largest in absolute terms where the curve is steepest: in dense places, where diesel exposure is highest to begin with.
+
+## 8.4 Question 18: Do the logistic model's assumptions hold?
+
+Logistic regression assumes each predictor is linear in the **log-odds**, that predicted probabilities match reality, and that observations are independent.
+
+```{r}
+#| label: fig-logit-linearity
+#| fig-cap: "Empirical log-odds of being in the top 20% for diesel PM in twenty equal-size groups of tracts, by % residents of color. Points near a straight line support the linearity assumption."
+ej %>%
+  mutate(bin = ntile(pct_poc, 20)) %>%                                # 20 groups of ~4,200 tracts
+  group_by(bin) %>%
+  summarise(pct_poc = mean(pct_poc), p = mean(top20)) %>%
+  mutate(log_odds = qlogis(pmin(pmax(p, 0.001), 0.999))) %>%          # share -> log-odds
+  ggplot(aes(pct_poc, log_odds)) +
+  geom_point(size = 2.5) +
+  geom_smooth(method = "lm", se = FALSE, colour = "firebrick", linetype = "dashed") +
+  labs(title = "Log-odds of being flagged rise with % residents of color",
+       x = "Residents who are people of color (%), group average",
+       y = "Log-odds of top 20% diesel PM")
+```
+
+```{r}
+#| label: fig-logit-calibration
+#| fig-cap: "Calibration: tracts grouped into tenths by predicted probability. Points on the dashed line mean predicted probabilities match the observed share flagged."
+data.frame(pred = fitted(m_logit), obs = ej$top20) %>%
+  mutate(bin = ntile(pred, 10)) %>%
+  group_by(bin) %>%
+  summarise(pred = mean(pred), obs = mean(obs)) %>%
+  ggplot(aes(pred, obs)) +
+  geom_abline(linetype = "dashed", colour = "grey50") +
+  geom_point(size = 2.5, colour = "firebrick") +
+  scale_x_continuous(labels = percent, limits = c(0, 1)) +
+  scale_y_continuous(labels = percent, limits = c(0, 1)) +
+  labs(title = "Predicted vs. observed share of tracts in the top 20%",
+       x = "Predicted probability", y = "Observed share flagged")
+```
+
+**Understanding the output:**
+
+- **Linearity in the log-odds:** the points **curve away from** the dashed line. The log-odds rise steeply between 0% and about 20% residents of color, then more gradually, and flatten above about 80%. So the single odds ratio of 1.18 per 10 points is an **average**: the association is stronger at low shares of residents of color and weaker at high shares. This matches the curved trend in the linear scatterplot (2.3). A spline or log term for % people of color would fit better; we keep the straight-line version so the odds ratio stays interpretable, and report this as a limitation.
+- **Calibration:** the points **lie very close to** the diagonal across the whole range, from near 0% to about 80%, so the model's predicted probabilities **are** trustworthy: when it predicts 50%, about 50% of those tracts are flagged.
+- **Independence:** fails for the same reasons as the linear models; that is why every interval above is clustered by county.
+
+# 9 All Models Side by Side
+
+| Model | Key result for % people of color | 95% CI (clustered) | Fit |
+|---|---|---|---|
+| `m1` simple | **10.6%** more diesel PM per +10 points | 8.7% to 12.6% | R² 0.158 |
+| `m2` + density | **0.8%** | −0.4% to 2.0% | R² 0.614 |
+| `m3` + income | **2.5%** | 1.2% to 3.9% | R² 0.625 |
+| `m4` + region (main) | **2.9%** | 1.9% to 3.8% | R² 0.642, adj. R² 0.6420 |
+| `m5` slope by region | from about **0%** (NY/NJ/PR, South Central) to **10.5%** (Pacific Northwest) | varies by region | adj. R² 0.6497 |
+| Within-region fits | positive in **7 of 10** regions; −0.5% to 9.0% | varies by region | — |
+| `m4z` standardized | β = **0.111** (density 0.739) | 0.074 to 0.149 | f² = 0.017 |
+
+```{r}
+#| label: fig-final-geo-model
+#| fig-cap: "The final geographic model (m5) against the data. Each panel is one EPA region. Hexagons count tracts, with diesel PM adjusted to the national average density and income using m5's coefficients. The red line is m5's predicted diesel PM at that average density and income, with a 95% county-clustered confidence band. Panel titles give each region's slope. 84,222 tracts."
+#| fig-width: 13
+#| fig-height: 6.5
+b <- coef(m5)                                                       # all m5 coefficients
+avg_dens <- mean(ej$log_density)                                    # national average (log) density
+avg_inc  <- mean(ej$lowinc10)                                       # national average % low income
+
+# Step 1: adjust each tract to average density and income
+ej_plot <- ej %>%
+  mutate(adj_log_dsl = log_dsl -
+           b["log_density"] * (log_density - avg_dens) -            # remove density's part
+           b["lowinc10"]    * (lowinc10    - avg_inc))              # remove income's part
+
+# Step 2: each region's slope from m5 (reference slope + that region's interaction term)
+slope_pct <- sapply(levels(ej$region), function(lv) {
+  s  <- b["poc10"]
+  nm <- paste0("poc10:region", lv)
+  if (nm %in% names(b)) s <- s + b[nm]                              # New England has no extra term
+  to_pct_change(s)
+})
+panel_lab <- setNames(paste0(levels(ej$region), "\n",
+                             sprintf("%+.1f%%", slope_pct), " per +10 pts"),
+                      levels(ej$region))
+
+# Step 3: m5's predicted line in each region, at average density and income
+grid <- expand.grid(pct_poc = 0:100, region = levels(ej$region)) %>%
+  mutate(poc10       = pct_poc / 10,
+         log_density = avg_dens,
+         lowinc10    = avg_inc,
+         region      = factor(region, levels = levels(ej$region)))
+X  <- model.matrix(delete.response(terms(m5)), grid)               # same columns as m5
+vc <- vcovCL(m5, cluster = ej$county)                               # clustered uncertainty
+grid$fit <- as.vector(X %*% b)                                      # predicted log10 diesel PM
+grid$se  <- sqrt(rowSums((X %*% vc) * X))                           # clustered SE of each prediction
+
+# Step 4: draw data and fitted lines together
+ggplot() +
+  geom_hex(data = ej_plot, aes(pct_poc, 10^adj_log_dsl), bins = 30) +
+  geom_ribbon(data = grid, aes(pct_poc, ymin = 10^(fit - 1.96 * se), ymax = 10^(fit + 1.96 * se)),
+              fill = "firebrick", alpha = 0.25) +
+  geom_line(data = grid, aes(pct_poc, 10^fit), colour = "firebrick", linewidth = 1.1) +
+  facet_wrap(~ region, nrow = 2, labeller = as_labeller(panel_lab)) +
+  scale_y_log10() +
+  scale_fill_viridis_c(trans = "log10", name = "Tracts") +
+  labs(title = "The people-of-color slope is steep in the West and flat in NY/NJ/PR and South Central",
+       x = "Residents who are people of color (%)",
+       y = "Diesel PM at average density and income (µg/m³, log scale)") +
+  theme(strip.text = element_text(face = "bold", size = 9))
+```
+
+
+# 10 Key Takeaways
+
+- **The raw gap:** each 10 points more residents of color goes with about **10.6%** more modelled diesel PM (`m1`).
+- **A multiple regression coefficient is the effect holding the others constant.** Density alone shrinks it to 0.8% (`m2`); adding income *reveals* part of it again (suppression, `m3`); with density, income, and region held constant it is **2.9%** (clustered 95% CI 1.9%–3.8%, `m4`). Most of the raw gap is explained by density, but not all.
+- **Predictors are not too correlated** (VIFs 1.38–2.01), and centering (`m4c`) changes only the intercept.
+- **Geography enters as a category** compared with a reference region, and the reference is a choice (`m4_rl`).
+- **The association is not the same everywhere** (`m5`): positive in 7 of 10 regions, strongest in Mountains & Plains (9.0%) and the Pacific Northwest (8.5%), and essentially zero in NY/NJ/PR and the South Central region.
+- **Independence fails,** and clustering by county widens intervals about six-fold. The conclusion survives.
+- **Effect sizes:** density dominates (β 0.74, f² 1.05); region is second (f² 0.046); the race effect is small in variance terms (β 0.11, f² 0.017) but clearly nonzero: about **15%** more diesel PM between a typical low- and high-share tract.
+- **p-values:** with 84,222 tracts the study could detect effects as small as 1.36% per 10 points, so significance is nearly guaranteed. Effect sizes and confidence intervals carry the conclusions.
+- **Logistic regression tells the same story** as a yes/no screen: each 10 points more residents of color multiplies the odds of being in the national top 20% for diesel PM by **1.18** (CI 1.11–1.26), holding density, income, and region constant, and the result is stable from the 70th to the 90th percentile cutoff.
+- **These are places, not people,** and diesel PM is a model estimate, not a measurement.
+
+# Appendix: Where Each Method Comes From
+
+| Method | Section | Source |
+|---|---|---|
+| Simple regression with `lm()`; slope, intercept, R², RSE by hand; ± 2 SE and `confint()` | 2 | Sharma, *Linear Regression Introduction* |
+| Adding predictors, "holding constant", R² vs. adjusted R² | 3 | Sharma, *Multiple Linear Regression* (Q1–Q3) |
+| Correlations and `vif_manual()` | 4.1 | Sharma, *Multiple Linear Regression* (Q4); function copied from the notes |
+| Region as a category, reference level, `relevel()` | 5.1–5.2 | Sharma, *Multiple Linear Regression* (Q5, Exercise 2) |
+| Interaction with `*`, per-group slopes with `lapply()`, `anova()` | 5.3 | Sharma, *Multiple Linear Regression* (Q6) |
+| Residual diagnostic plots | 6.1 | Sharma, *Multiple Linear Regression* (Q7) |
+| t statistic, p-value, Type I/II errors, power | 7.2 | Sharma, *Hypothesis Testing, t and p Values, Type I and II Errors, and Power* |
+| Logistic regression, odds ratios, by-hand probabilities, probability curves | 8.1–8.3 | Sharma, *Logistic Regression* (Sections 2, 4–6, 9) |
+| Train/test split, ROC/AUC, confusion matrix, equity check | 8.6 | Sharma, *Logistic Regression* (Section 8) |
+
+# References
+
+- Cohen, J. (1988). *Statistical Power Analysis for the Behavioral Sciences* (2nd ed.). Lawrence Erlbaum.
+- Fitzgerald, W., & Gehrke, G. (2025). *EPA Environmental Justice Screening Tool (EJ Screen) data, 2015–2024* (Version v1) [Data set]. Zenodo. <https://doi.org/10.5281/zenodo.14767363>
+- Robin, X., et al. (2011). pROC: an open-source package for R and S+ to analyze and compare ROC curves. *BMC Bioinformatics*, 12, 77.
+- Sharma, N. *Linear Regression Introduction*; *Multiple Linear Regression*; *Logistic Regression*; *Hypothesis Testing, t and p Values, Type I and II Errors, and Power*. INFO 536 course notes.
+- U.S. Environmental Protection Agency. *Regional and Geographic Offices.* <https://www.epa.gov/aboutepa/regional-and-geographic-offices>
+- Wasserstein, R. L., Schirm, A. L., & Lazar, N. A. (2019). Moving to a world beyond "p < 0.05." *The American Statistician*, 73(sup1).
+- Zeileis, A., Köll, S., & Graham, N. (2020). Various versatile variances: An object-oriented implementation of clustered covariances in R. *Journal of Statistical Software*, 95(1).
