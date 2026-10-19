@@ -1,0 +1,363 @@
+---
+title: "Traffic_Proximity"
+format: html
+editor: visual
+---
+
+```{r}
+library(tidyverse)
+```
+
+```{r}
+data_path <- paste0(
+  "data/raw/",
+  "EJScreen_2024_Tract_with_AS_CNMI_GU_VI.csv/",
+  "EJSCREEN_2024_Tract_with_AS_CNMI_GU_VI.csv"
+)
+
+ej <- read_csv(data_path, show_col_types = FALSE)
+
+dim(ej)
+```
+
+```{r}
+analysis_data <- ej %>%
+  transmute(
+    tract_id = ID,
+    state = STATE_NAME,
+    region = REGION,
+    population = ACSTOTPOP,
+    people_of_color_pct = PEOPCOLORPCT,
+    low_income_pct = LOWINCPCT,
+    diesel_pm = DSLPM,
+    traffic_proximity = PTRAF,
+    land_area_m2 = AREALAND,
+    population_density = ACSTOTPOP /
+      (AREALAND / 2589988.11)
+  )
+
+dim(analysis_data)
+```
+
+```{r}
+analysis_clean <- analysis_data %>%
+  filter(
+    population > 0,
+    land_area_m2 > 0,
+    !is.na(diesel_pm),
+    !is.na(people_of_color_pct),
+    !is.na(low_income_pct),
+    !is.na(region),
+    is.finite(population_density)
+  )
+
+nrow(analysis_clean)
+```
+
+```{r}
+analysis_clean <- analysis_clean %>%
+  mutate(
+    log_population_density = log1p(population_density),
+    log_traffic_proximity = if_else(
+      !is.na(traffic_proximity) &
+        traffic_proximity >= 0,
+      log1p(traffic_proximity),
+      NA_real_
+    )
+  )
+
+summary(analysis_clean$log_traffic_proximity)
+```
+
+```{r}
+traffic_data <- analysis_clean %>%
+  drop_na(
+    diesel_pm,
+    people_of_color_pct,
+    log_traffic_proximity,
+    log_population_density,
+    low_income_pct,
+    region
+  )
+
+nrow(traffic_data)
+```
+
+## Subquestion 1: Traffic proximity and diesel PM
+
+Question: How is traffic proximity associated with modeled diesel PM across census tracts?
+
+```{r}
+
+traffic_data %>%
+  summarise(
+    n_tracts = n(),
+    mean_diesel_pm = mean(diesel_pm),
+    median_diesel_pm = median(diesel_pm),
+    mean_traffic = mean(traffic_proximity),
+    median_traffic = median(traffic_proximity),
+    min_traffic = min(traffic_proximity),
+    max_traffic = max(traffic_proximity)
+  )
+```
+
+```{r}
+model_traffic <- lm(
+  diesel_pm ~ log_traffic_proximity,
+  data = traffic_data
+)
+
+summary(model_traffic)
+```
+
+```{r}
+confint(model_traffic)
+```
+
+```{r}
+p_traffic <- ggplot(
+  traffic_data,
+  aes(
+    x = log_traffic_proximity,
+    y = diesel_pm
+  )
+) +
+  geom_point(
+    alpha = 0.08,
+    size = 0.4,
+    color = "steelblue"
+  ) +
+  geom_smooth(
+    method = "lm",
+    formula = y ~ x,
+    color = "firebrick",
+    se = TRUE
+  ) +
+  labs(
+    title = "Traffic Proximity and Modeled Diesel PM",
+    x = "Log-transformed traffic proximity",
+    y = "Modeled diesel PM",
+    caption = "Source: EPA EJScreen 2024 census tract data"
+  ) +
+  theme_minimal()
+
+p_traffic
+```
+
+## Subquestion 2: Does traffic account for part of the demographic association?
+
+Question: How much does the association between people-of-color share and diesel PM change after adding traffic proximity?
+
+```{r}
+model_demographic <- lm(
+  diesel_pm ~ people_of_color_pct,
+  data = traffic_data
+)
+
+summary(model_demographic)
+```
+
+```{r}
+model_demographic_traffic <- lm(
+  diesel_pm ~
+    people_of_color_pct +
+    log_traffic_proximity,
+  data = traffic_data
+)
+
+summary(model_demographic_traffic)
+```
+
+```{r}
+beta_before <- coef(
+  model_demographic
+)["people_of_color_pct"]
+
+beta_after <- coef(
+  model_demographic_traffic
+)["people_of_color_pct"]
+
+reduction_pct <- 100 *
+  (beta_before - beta_after) / beta_before
+
+reduction_pct
+```
+
+```{r}
+confint(
+  model_demographic,
+  "people_of_color_pct"
+) * 0.10
+
+confint(
+  model_demographic_traffic,
+  "people_of_color_pct"
+) * 0.10
+```
+
+## Subquestion 3: Fully adjusted traffic analysis
+
+Question: Does traffic proximity remain associated with diesel PM after accounting for other neighborhood characteristics?
+
+```{r}
+model_traffic_adjusted <- lm(
+  diesel_pm ~
+    log_traffic_proximity +
+    people_of_color_pct +
+    log_population_density +
+    low_income_pct +
+    factor(region),
+  data = traffic_data
+)
+
+summary(model_traffic_adjusted)
+```
+
+```{r}
+confint(model_traffic_adjusted)
+```
+
+```{r}
+model_comparison <- tibble(
+  model = c(
+    "Demographic only",
+    "Demographic + traffic",
+    "Fully adjusted"
+  ),
+  r_squared = c(
+    summary(model_demographic)$r.squared,
+    summary(model_demographic_traffic)$r.squared,
+    summary(model_traffic_adjusted)$r.squared
+  ),
+  adjusted_r_squared = c(
+    summary(model_demographic)$adj.r.squared,
+    summary(model_demographic_traffic)$adj.r.squared,
+    summary(model_traffic_adjusted)$adj.r.squared
+  )
+)
+
+model_comparison
+```
+
+```{r}
+get_poc_effect <- function(model, name) {
+  beta <- coef(model)["people_of_color_pct"]
+
+  ci <- confint(
+    model,
+    "people_of_color_pct"
+  )
+
+  tibble(
+    model = name,
+    estimate = beta * 0.10,
+    lower = ci[1] * 0.10,
+    upper = ci[2] * 0.10
+  )
+}
+
+poc_effects <- bind_rows(
+  get_poc_effect(
+    model_demographic,
+    "Unadjusted"
+  ),
+  get_poc_effect(
+    model_demographic_traffic,
+    "Traffic adjusted"
+  ),
+  get_poc_effect(
+    model_traffic_adjusted,
+    "Fully adjusted"
+  )
+)
+
+poc_effects
+```
+
+```{r}
+p_coefficients <- ggplot(
+  poc_effects,
+  aes(
+    x = estimate,
+    y = reorder(model, estimate)
+  )
+) +
+  geom_point(
+    size = 3,
+    color = "steelblue"
+  ) +
+  geom_errorbar(
+    aes(
+      xmin = lower,
+      xmax = upper
+    ),
+    orientation = "y",
+    width = 0.15
+  ) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed"
+  ) +
+  labs(
+    title = "Demographic Association Across Regression Models",
+    subtitle = "Effect of a 10-percentage-point increase in people-of-color share",
+    x = "Change in modeled diesel PM (95% CI)",
+    y = NULL,
+    caption = "Source: EPA EJScreen 2024 census tract data"
+  ) +
+  theme_minimal()
+
+p_coefficients
+```
+
+## Model diagnostics
+
+These help assess whether the linear regression assumptions are reasonable.
+
+```{r}
+par(mfrow = c(1, 2))
+
+plot(model_traffic, which = 1)
+plot(model_traffic_adjusted, which = 1)
+
+par(mfrow = c(1, 1))
+```
+
+```{r}
+par(mfrow = c(1, 2))
+
+plot(model_traffic, which = 2)
+plot(model_traffic_adjusted, which = 2)
+
+par(mfrow = c(1, 1))
+```
+
+```{r}
+plot(
+  model_traffic_adjusted,
+  which = 4
+)
+```
+
+```{r}
+dir.create(
+  "figures",
+  showWarnings = FALSE
+)
+
+ggsave(
+  "figures/traffic_vs_diesel_pm.png",
+  plot = p_traffic,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+
+ggsave(
+  "figures/traffic_coefficient_comparison.png",
+  plot = p_coefficients,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+```

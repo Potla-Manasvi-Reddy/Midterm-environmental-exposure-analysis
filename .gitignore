@@ -53,3 +53,8 @@ rsconnect/
 .Rproj.user/
 .Rhistory
 .DS_Store
+
+
+# Project data
+data/raw/
+
