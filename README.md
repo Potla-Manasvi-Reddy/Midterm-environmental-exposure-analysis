@@ -56,6 +56,16 @@ Adding traffic proximity to the adjusted model increases R² from 0.6422 to 0.68
 
 The decile analysis provides a complementary descriptive result: mean modeled diesel PM is approximately 8.1 times higher in the highest traffic-proximity decile than in the lowest.
 
+## Figures
+
+The `figures/` folder contains three visualizations from the analysis:
+
+1. **Traffic Proximity and Diesel PM:** A hexbin plot showing the relationship between traffic proximity and modeled diesel PM concentrations.
+
+2. **Demographic Association With and Without Traffic Proximity:** A coefficient comparison plot showing how the demographic association changes after including traffic proximity in the adjusted regression model.
+
+3. **Diesel PM Across Traffic-Proximity Deciles:** A plot comparing mean modeled diesel PM concentrations across ten traffic-proximity groups.
+
 ## Model Diagnostics and Limitations
 
 Residual diagnostics indicate some departures from linearity and constant variance. Spatial dependence between neighboring census tracts may also affect conventional standard errors and confidence intervals.
