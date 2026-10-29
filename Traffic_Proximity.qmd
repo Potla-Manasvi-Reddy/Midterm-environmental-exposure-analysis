@@ -1,12 +1,26 @@
 ---
-title: "Traffic_Proximity"
+title: "Traffic Proximity and Diesel PM Exposure"
+subtitle: "EPA EJScreen 2024 Census-Tract Analysis"
 format: html
 editor: visual
 ---
 
+## Research focus
+
+This analysis examines the relationship between traffic proximity and modeled diesel particulate matter (PM) concentrations across U.S. census tracts. The main objective is to determine whether traffic proximity helps account for differences in diesel PM associated with neighborhood demographic composition.
+
+The analysis begins with the relationship between traffic proximity and diesel PM, followed by a comparison of adjusted regression models with and without traffic. Differences across traffic-proximity levels and model diagnostics are also examined.
+
 ```{r}
 library(tidyverse)
+library(hexbin)
 ```
+
+## Data preparation
+
+The analysis uses EPA EJScreen 2024 census-tract data. The variables include modeled diesel PM, traffic proximity, population, land area, percentage of residents of color, low-income percentage, and EPA region.
+
+Census tracts with fewer than 100 residents, invalid land area, or missing values required for the regression models were excluded.
 
 ```{r}
 data_path <- paste0(
@@ -42,7 +56,7 @@ dim(analysis_data)
 ```{r}
 analysis_clean <- analysis_data %>%
   filter(
-    population > 0,
+    population >= 100,
     land_area_m2 > 0,
     !is.na(diesel_pm),
     !is.na(people_of_color_pct),
@@ -83,23 +97,22 @@ traffic_data <- analysis_clean %>%
 nrow(traffic_data)
 ```
 
-## Subquestion 1: Traffic proximity and diesel PM
-
-Question: How is traffic proximity associated with modeled diesel PM across census tracts?
-
 ```{r}
+traffic_data <- traffic_data %>%
+  mutate(log_diesel_pm = log10(diesel_pm))
 
-traffic_data %>%
-  summarise(
-    n_tracts = n(),
-    mean_diesel_pm = mean(diesel_pm),
-    median_diesel_pm = median(diesel_pm),
-    mean_traffic = mean(traffic_proximity),
-    median_traffic = median(traffic_proximity),
-    min_traffic = min(traffic_proximity),
-    max_traffic = max(traffic_proximity)
-  )
+summary(traffic_data$log_diesel_pm)
 ```
+
+The final analytical sample contains 84,222 census tracts. Diesel PM is measured in µg/m³. Traffic proximity and population density were transformed using log(1 + x) to reduce the influence of extreme values.
+
+For the adjusted models, diesel PM was transformed using log10. This allows the estimated coefficients to be expressed as percentage differences in diesel PM concentrations. The same observations are used throughout the model comparisons.
+
+## 1. Traffic proximity and diesel PM exposure
+
+Our first question is whether census tracts with higher traffic-proximity values also have higher modeled diesel PM concentrations.
+
+The first model examines the association between traffic proximity and diesel PM without additional controls. Diesel PM is retained in its original units to estimate the difference in concentration associated with a one-unit increase in log-transformed traffic proximity.
 
 ```{r}
 model_traffic <- lm(
@@ -108,242 +121,302 @@ model_traffic <- lm(
 )
 
 summary(model_traffic)
-```
-
-```{r}
 confint(model_traffic)
 ```
+
+Traffic proximity has a positive association with modeled diesel PM. The estimated coefficient is 0.0422 (95% CI: 0.0418–0.0426), indicating an increase of 0.0422 µg/m³ in diesel PM for each one-unit increase in log-transformed traffic proximity.
+
+The model explains approximately 39.2% of the variation in diesel PM (R² = 0.392). Traffic proximity is therefore an important predictor of modeled diesel PM, even before accounting for other neighborhood characteristics.
 
 ```{r}
 p_traffic <- ggplot(
   traffic_data,
-  aes(
-    x = log_traffic_proximity,
-    y = diesel_pm
-  )
+  aes(x = log_traffic_proximity, y = diesel_pm)
 ) +
-  geom_point(
-    alpha = 0.08,
-    size = 0.4,
-    color = "steelblue"
-  ) +
+  geom_hex(bins = 55) +
   geom_smooth(
     method = "lm",
-    formula = y ~ x,
-    color = "firebrick",
-    se = TRUE
+    se = TRUE,
+    color = "#B33A3A",
+    linewidth = 0.9
+  ) +
+  scale_fill_viridis_c(
+    trans = "log10",
+    name = "Number of tracts"
   ) +
   labs(
-    title = "Traffic Proximity and Modeled Diesel PM",
+    title = "Diesel PM increases with traffic proximity",
+    subtitle = "EPA EJScreen 2024 | 84,222 census tracts",
     x = "Log-transformed traffic proximity",
-    y = "Modeled diesel PM",
-    caption = "Source: EPA EJScreen 2024 census tract data"
+    y = expression("Modeled diesel PM (" * mu * "g/m"^3 * ")"),
+    caption = "Hexagons show tract counts; red line shows the fitted linear regression."
   ) +
-  theme_minimal()
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    legend.position = "right"
+  )
 
 p_traffic
 ```
 
-## Subquestion 2: Does traffic account for part of the demographic association?
+The hexbin plot shows a clear upward relationship between traffic proximity and diesel PM. Concentrations generally increase with traffic proximity, although substantial variation remains within individual traffic levels.
 
-Question: How much does the association between people-of-color share and diesel PM change after adding traffic proximity?
+The fitted regression line captures the overall trend, while the spread of observations indicates that other factors also contribute to differences in diesel PM across census tracts.
 
-```{r}
-model_demographic <- lm(
-  diesel_pm ~ people_of_color_pct,
-  data = traffic_data
-)
+## 2. Traffic proximity and the demographic association
 
-summary(model_demographic)
-```
+To examine whether traffic proximity accounts for part of the demographic association, two multiple linear regression models were estimated using log10-transformed diesel PM.
+
+Both models include the percentage of residents of color, population density, low-income percentage, and EPA region. Traffic proximity is added to the second model. Holding the sample and other predictors constant allows the change in the demographic coefficient to be examined directly.
 
 ```{r}
-model_demographic_traffic <- lm(
-  diesel_pm ~
-    people_of_color_pct +
-    log_traffic_proximity,
-  data = traffic_data
-)
-
-summary(model_demographic_traffic)
-```
-
-```{r}
-beta_before <- coef(
-  model_demographic
-)["people_of_color_pct"]
-
-beta_after <- coef(
-  model_demographic_traffic
-)["people_of_color_pct"]
-
-reduction_pct <- 100 *
-  (beta_before - beta_after) / beta_before
-
-reduction_pct
-```
-
-```{r}
-confint(
-  model_demographic,
-  "people_of_color_pct"
-) * 0.10
-
-confint(
-  model_demographic_traffic,
-  "people_of_color_pct"
-) * 0.10
-```
-
-## Subquestion 3: Fully adjusted traffic analysis
-
-Question: Does traffic proximity remain associated with diesel PM after accounting for other neighborhood characteristics?
-
-```{r}
-model_traffic_adjusted <- lm(
-  diesel_pm ~
-    log_traffic_proximity +
-    people_of_color_pct +
+# Model without traffic proximity
+model_without_traffic <- lm(
+  log_diesel_pm ~ people_of_color_pct +
     log_population_density +
     low_income_pct +
     factor(region),
   data = traffic_data
 )
 
-summary(model_traffic_adjusted)
-```
-
-```{r}
-confint(model_traffic_adjusted)
-```
-
-```{r}
-model_comparison <- tibble(
-  model = c(
-    "Demographic only",
-    "Demographic + traffic",
-    "Fully adjusted"
-  ),
-  r_squared = c(
-    summary(model_demographic)$r.squared,
-    summary(model_demographic_traffic)$r.squared,
-    summary(model_traffic_adjusted)$r.squared
-  ),
-  adjusted_r_squared = c(
-    summary(model_demographic)$adj.r.squared,
-    summary(model_demographic_traffic)$adj.r.squared,
-    summary(model_traffic_adjusted)$adj.r.squared
-  )
+# Model with traffic proximity
+model_traffic_log <- lm(
+  log_diesel_pm ~ people_of_color_pct +
+    log_traffic_proximity +
+    log_population_density +
+    low_income_pct +
+    factor(region),
+  data = traffic_data
 )
 
-model_comparison
+summary(model_without_traffic)
+summary(model_traffic_log)
 ```
 
 ```{r}
-get_poc_effect <- function(model, name) {
-  beta <- coef(model)["people_of_color_pct"]
+# Regression coefficients and 95% confidence intervals
 
-  ci <- confint(
-    model,
-    "people_of_color_pct"
-  )
+get_coefficients <- function(model, model_name) {
+  estimates <- coef(model)
+  intervals <- confint(model)
 
   tibble(
-    model = name,
-    estimate = beta * 0.10,
-    lower = ci[1] * 0.10,
-    upper = ci[2] * 0.10
+    Model = model_name,
+    Predictor = names(estimates),
+    Coefficient = round(unname(estimates), 4),
+    `95% CI Lower` = round(intervals[, 1], 4),
+    `95% CI Upper` = round(intervals[, 2], 4)
   )
 }
 
-poc_effects <- bind_rows(
-  get_poc_effect(
-    model_demographic,
-    "Unadjusted"
+coefficient_table <- bind_rows(
+  get_coefficients(model_traffic, "1. Simple traffic"),
+  get_coefficients(model_without_traffic, "2. Without traffic"),
+  get_coefficients(model_traffic_log, "3. With traffic")
+)
+
+knitr::kable(
+  coefficient_table,
+  caption = "Regression coefficients and 95% confidence intervals"
+)
+```
+
+Traffic proximity remains positively associated with diesel PM after controlling for demographic composition, population density, income, and EPA region. The adjusted traffic coefficient is 0.0543 on the log10 scale, corresponding to approximately 13.3% higher modeled diesel PM for a one-unit increase in log-transformed traffic proximity, holding the other variables constant.
+
+In the model without traffic proximity, a 10-percentage-point increase in the share of residents of color is associated with 2.79% higher modeled diesel PM, controlling for population density, income, and EPA region.
+
+After including traffic proximity, the estimated difference decreases to 1.56%, representing approximately a 44% reduction in the demographic coefficient. The association remains positive, but its magnitude is substantially smaller.
+
+This attenuation indicates that traffic proximity accounts for part of the statistical relationship between demographic composition and diesel PM. It does not, however, establish that traffic proximity causally explains the disparity.
+
+```{r}
+model_comparison <- tibble(
+  Model = c("Without traffic", "With traffic"),
+  `R-squared` = c(
+    summary(model_without_traffic)$r.squared,
+    summary(model_traffic_log)$r.squared
   ),
-  get_poc_effect(
-    model_demographic_traffic,
-    "Traffic adjusted"
-  ),
-  get_poc_effect(
-    model_traffic_adjusted,
-    "Fully adjusted"
+  `Demographic effect (%)` = c(
+    (10^(coef(model_without_traffic)["people_of_color_pct"] * 0.10) - 1) * 100,
+    (10^(coef(model_traffic_log)["people_of_color_pct"] * 0.10) - 1) * 100
   )
 )
 
-poc_effects
+knitr::kable(
+  model_comparison,
+  digits = 3,
+  caption = "Comparison of adjusted models with and without traffic proximity"
+)
 ```
 
+Including traffic proximity improves model fit, with R² increasing from 0.642 to 0.685. The additional predictor accounts for approximately 4.3 percentage points more variation in log-transformed diesel PM.
+
+The reduction in the demographic coefficient is notable because the two models differ only in the inclusion of traffic proximity. This indicates that traffic provides information beyond population density, income, and EPA region.
+
 ```{r}
+poc_effects <- bind_rows(
+  tibble(
+    model = "Without traffic",
+    beta = coef(model_without_traffic)["people_of_color_pct"],
+    lower = confint(model_without_traffic)["people_of_color_pct", 1],
+    upper = confint(model_without_traffic)["people_of_color_pct", 2]
+  ),
+  tibble(
+    model = "With traffic",
+    beta = coef(model_traffic_log)["people_of_color_pct"],
+    lower = confint(model_traffic_log)["people_of_color_pct", 1],
+    upper = confint(model_traffic_log)["people_of_color_pct", 2]
+  )
+) %>%
+  mutate(
+    estimate = (10^(beta * 0.10) - 1) * 100,
+    lower = (10^(lower * 0.10) - 1) * 100,
+    upper = (10^(upper * 0.10) - 1) * 100,
+    model = factor(model, levels = c("With traffic", "Without traffic"))
+  )
+
 p_coefficients <- ggplot(
   poc_effects,
-  aes(
-    x = estimate,
-    y = reorder(model, estimate)
-  )
+  aes(x = estimate, y = model)
 ) +
-  geom_point(
-    size = 3,
-    color = "steelblue"
-  ) +
-  geom_errorbar(
-    aes(
-      xmin = lower,
-      xmax = upper
-    ),
-    orientation = "y",
-    width = 0.15
-  ) +
   geom_vline(
     xintercept = 0,
-    linetype = "dashed"
+    linetype = "dashed",
+    color = "grey60"
+  ) +
+  geom_errorbar(
+    aes(xmin = lower, xmax = upper),
+    orientation = "y",
+    width = 0.15,
+    linewidth = 0.7,
+    color = "#333333"
+  ) +
+  geom_point(
+    size = 3.5,
+    color = "#B33A3A"
   ) +
   labs(
-    title = "Demographic Association Across Regression Models",
-    subtitle = "Effect of a 10-percentage-point increase in people-of-color share",
-    x = "Change in modeled diesel PM (95% CI)",
+    title = "The demographic association decreases after adding traffic",
+    subtitle = "Estimated change in diesel PM per 10-percentage-point increase in residents of color",
+    x = "Estimated difference in diesel PM (%)",
     y = NULL,
-    caption = "Source: EPA EJScreen 2024 census tract data"
+    caption = "Points show adjusted estimates; bars show conventional 95% confidence intervals."
   ) +
-  theme_minimal()
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
 
 p_coefficients
 ```
 
-## Model diagnostics
+The coefficient comparison illustrates the reduction in the estimated demographic association after controlling for traffic proximity. Although the coefficient becomes smaller, it remains positive.
 
-These help assess whether the linear regression assumptions are reasonable.
+The confidence intervals are based on conventional regression standard errors. They do not account for potential correlation between neighboring census tracts, which may affect the precision of the estimates.
+
+## 3. Diesel PM across traffic-proximity levels
+
+To examine how diesel PM varies across the traffic-proximity distribution, census tracts were divided into ten approximately equal-sized groups. The first decile represents the lowest traffic-proximity values, while the tenth represents the highest.
+
+Mean diesel PM was calculated for each decile to compare concentration levels across the distribution without imposing a regression model.
 
 ```{r}
-par(mfrow = c(1, 2))
+traffic_deciles <- traffic_data %>%
+  mutate(
+    traffic_decile = ntile(log_traffic_proximity, 10)
+  ) %>%
+  group_by(traffic_decile) %>%
+  summarise(
+    mean_diesel_pm = mean(diesel_pm),
+    n_tracts = n(),
+    .groups = "drop"
+  )
 
-plot(model_traffic, which = 1)
-plot(model_traffic_adjusted, which = 1)
+p_deciles <- ggplot(
+  traffic_deciles,
+  aes(x = traffic_decile, y = mean_diesel_pm)
+) +
+  geom_line(
+    color = "#334E68",
+    linewidth = 1
+  ) +
+  geom_point(
+    color = "#B33A3A",
+    size = 3
+  ) +
+  scale_x_continuous(breaks = 1:10) +
+  labs(
+    title = "Average diesel PM rises across traffic-proximity deciles",
+    subtitle = "84,222 census tracts grouped by traffic proximity",
+    x = "Traffic-proximity decile (lowest to highest)",
+    y = expression("Mean modeled diesel PM (" * mu * "g/m"^3 * ")"),
+    caption = "Source: EPA EJScreen 2024. Means are calculated across census tracts."
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+p_deciles
+
+knitr::kable(
+  traffic_deciles,
+  digits = 4,
+  caption = "Mean diesel PM by traffic-proximity decile"
+)
+```
+
+Mean modeled diesel PM increases consistently across all ten traffic-proximity deciles. The lowest decile has an average concentration of 0.0529 µg/m³, compared with 0.4273 µg/m³ in the highest decile.
+
+The highest-traffic group therefore has approximately 8.1 times the mean diesel PM concentration of the lowest-traffic group.
+
+These differences are descriptive and have not been adjusted for demographic composition, income, population density, or region. Nevertheless, the pattern is consistent with the positive traffic association identified in the regression analysis.
+
+## 4. Model diagnostics
+
+Residual diagnostics were examined for all three regression models, focusing on linearity, constant variance, normality, and influential observations. The fully adjusted model is discussed in more detail because it includes traffic proximity alongside demographic and geographic factors.
+
+```{r}
+# Diagnostics for the simple regression
+par(mfrow = c(2, 2))
+plot(model_traffic, which = 1:4)
+
+# Diagnostics for the adjusted model without traffic
+par(mfrow = c(2, 2))
+plot(model_without_traffic, which = 1:4)
+
+# Diagnostics for the adjusted model with traffic
+par(mfrow = c(2, 2))
+plot(model_traffic_log, which = 1:4)
 
 par(mfrow = c(1, 1))
 ```
 
+The residuals-versus-fitted plot shows some curvature, suggesting that the linear model may not capture all the patterns in the data. The scale-location plot indicates that residual variance is not constant, while the Q-Q plot shows noticeable departures from normality in the tails. Cook's distance identifies several potentially influential observations, but no single tract appears to have an unusually large influence on the fitted model.
+
+Independence is another concern. Census tracts located near one another may share highways, pollution sources, and other environmental conditions. This can introduce spatial correlation that is not accounted for by ordinary linear regression. The models also use conventional standard errors, which may produce confidence intervals that are too narrow when residual variance is unequal or nearby observations are correlated.
+
+These issues mainly affect how precisely the coefficients can be estimated and how confidently the results can be interpreted. The positive association between traffic proximity and diesel PM remains an important finding, but the model limitations need to be considered when drawing conclusions.
+
+## 5. Discussion and limitations
+
+Traffic proximity appears to be an important factor in understanding differences in diesel PM across census tracts. The simple regression explains 39.2% of the variation in modeled diesel PM, and adding traffic to the adjusted model increases R² from 0.642 to 0.685.
+
+One result worth highlighting is how much the demographic coefficient changes. Before including traffic, a 10-percentage-point increase in residents of color is associated with 2.79% higher diesel PM. After including traffic, that estimate falls to 1.56%, a reduction of about 44%. The association does not disappear, but the change suggests that traffic proximity captures some of the differences that were previously reflected in the demographic coefficient.
+
+The decile analysis tells a similar story. Average diesel PM rises steadily from the lowest to the highest traffic-proximity group, with concentrations increasing from 0.0529 to 0.4273 µg/m³. The highest decile has roughly eight times the average diesel PM of the lowest decile.
+
+There are some limitations to consider. EJScreen provides modeled diesel PM estimates rather than direct measurements of exposure, and the traffic-proximity indicator does not measure actual vehicle emissions. The analysis also uses census-tract averages, which cannot tell us how exposure differs between individuals living within the same tract. The diagnostic plots show some curvature, unequal residual variance, and departures from normality. In addition, neighboring tracts may share pollution sources, so the conventional standard errors may underestimate uncertainty.
+
+The results show that including traffic proximity changes both the model fit and the estimated demographic association. Traffic helps account for some of the observed differences in diesel PM, but it does not explain them completely. Further analysis of other local pollution sources and spatial patterns would be needed to understand the remaining variation.
+
 ```{r}
-par(mfrow = c(1, 2))
-
-plot(model_traffic, which = 2)
-plot(model_traffic_adjusted, which = 2)
-
-par(mfrow = c(1, 1))
-```
-
-```{r}
-plot(
-  model_traffic_adjusted,
-  which = 4
-)
-```
-
-```{r}
-dir.create(
-  "figures",
-  showWarnings = FALSE
-)
+dir.create("figures", showWarnings = FALSE)
 
 ggsave(
   "figures/traffic_vs_diesel_pm.png",
@@ -356,6 +429,14 @@ ggsave(
 ggsave(
   "figures/traffic_coefficient_comparison.png",
   plot = p_coefficients,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+
+ggsave(
+  "figures/traffic_deciles.png",
+  plot = p_deciles,
   width = 8,
   height = 5,
   dpi = 300
